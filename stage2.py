@@ -109,7 +109,7 @@ def clip_feat_loss(clip_enc: CLIPFeature, img1, img2):
 # --------------------- Stage-2 Training -------------------------
 # ================================================================
 def run_stage2(ckpt_path,
-               out_dir="stage2_out",
+               out_dir=None,
                H=64, W=64, fov=45.0, radius=2.5,
                samples=64,
                hidden=64, lr=5e-4, lam_pix=0.05,
@@ -140,6 +140,8 @@ def run_stage2(ckpt_path,
     fx = fy = 0.5 * W / math.tan(0.5 * math.radians(fov))
     cx, cy = W * 0.5, H * 0.5
 
+    if out_dir is None:
+        out_dir = os.path.join(config.results_dir, "stage2_out")
     os.makedirs(out_dir, exist_ok=True)
 
     use_amp = False  # Disabled due to GradScaler compatibility issues with PyTorch 2.8

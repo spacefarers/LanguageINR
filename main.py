@@ -17,7 +17,7 @@ def run_eval_only(ckpt_path, transfer_ckpt,
                   H=64, W=64, fov=45.0, radius=2.5, samples=64,
                   dvr_density_scale=20.0, dvr_offset=0.0,
                   clip_model="ViT-B-16", clip_pretrained="laion2b_s34b_b88k",
-                  sample_index=1, eval_K=20, out_dir="eval_out"):
+                  sample_index=1, eval_K=20, out_dir=None):
     """Run evaluation only using pre-trained models"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -46,6 +46,8 @@ def run_eval_only(ckpt_path, transfer_ckpt,
     )
     clip_enc = clip_model_obj.visual
 
+    if out_dir is None:
+        out_dir = os.path.join(config.results_dir, "eval_out")
     os.makedirs(out_dir, exist_ok=True)
     eval_csv = os.path.join(out_dir, "eval_novel_views.csv")
     
@@ -71,7 +73,7 @@ def main():
     parser.add_argument("--s1_lr", type=float, default=1e-3)
     # Stage-2 opts
     parser.add_argument("--ckpt", type=str, default=None, help="Path to Stage-1 ckpt (if mode=stage2)")
-    parser.add_argument("--out_dir", type=str, default="stage2_out")
+    parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--H", type=int, default=256)
     parser.add_argument("--W", type=int, default=256)
     parser.add_argument("--fov", type=float, default=45.0)
@@ -107,9 +109,12 @@ def main():
             raise FileNotFoundError(f"Please provide a valid --ckpt for mode={args.mode}")
 
     if args.mode in ("stage2", "both"):
+        stage2_out_dir = args.out_dir
+        if stage2_out_dir is None:
+            stage2_out_dir = os.path.join(config.results_dir, "stage2_out")
         run_stage2(
             ckpt_path=ckpt_path,
-            out_dir=args.out_dir,
+            out_dir=stage2_out_dir,
             H=args.H, W=args.W, fov=args.fov, radius=args.radius,
             samples=args.samples,
             hidden=args.hidden, lr=args.s2_lr, lam_pix=args.lam_pix,
@@ -123,6 +128,9 @@ def main():
     elif args.mode == "eval":
         if args.transfer_ckpt is None or not os.path.exists(args.transfer_ckpt):
             raise FileNotFoundError("Please provide a valid --transfer_ckpt for mode=eval")
+        eval_out_dir = args.out_dir
+        if eval_out_dir is None:
+            eval_out_dir = os.path.join(config.results_dir, "eval_out")
         run_eval_only(
             ckpt_path=ckpt_path,
             transfer_ckpt=args.transfer_ckpt,
@@ -132,7 +140,7 @@ def main():
             clip_model=args.clip_model, clip_pretrained=args.clip_pretrained,
             sample_index=args.sample_index,
             eval_K=args.eval_K,
-            out_dir=args.out_dir
+            out_dir=eval_out_dir
         )
 
 if __name__ == "__main__":
