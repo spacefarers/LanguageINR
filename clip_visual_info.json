@@ -1,0 +1,1 @@
+{"visual_class": "open_clip.timm_model.TimmModel", "trunk_class": "timm.models.eva.Eva", "has_blocks": true, "has_forward_features": true, "has_patch_embed": true, "features": ["forward", "forward_features", "forward_head", "forward_intermediates"]}
