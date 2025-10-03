@@ -45,71 +45,64 @@ def main(mode="stage2"):
             print(f"Camera {i + 1:2d} | Azimuth: {cam.azi * 180 / np.pi:5.1f}° | Polar: {cam.polar * 180 / np.pi:5.1f}° | Position: ({pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f})")
 
     if mode == "stage2" or mode == "all":
-        print("Starting Stage 2 Distillation...")
-        import stage2  # new
-        try:
-            import open_clip
-        except Exception as e:
-            raise RuntimeError(
-                "open_clip is required for Stage 2. Install via: pip install open-clip-torch"
-            ) from e
+        print("Starting Stage 2 Training with CLIPSeg...")
+        import stage2
 
-        # Load OpenCLIP image encoder (frozen)
-        clip_model, _, _ = open_clip.create_model_and_transforms(
-            'ViT-B-32', pretrained='laion2b_s34b_b79k'
-        )
-        clip_model = clip_model.to(device).eval()
-        for p in clip_model.parameters():
-            p.requires_grad = False
+        clipseg_weights_path = "./weights/rd64-uni.pth"
+        clipseg_model = stage2.load_clipseg_model(clipseg_weights_path, model_device=device)
 
-        # Discover embedding dim and build semantic layer
-        # We query by running a tiny dummy tensor through encode_image
-        dummy = torch.zeros(1, 3, 224, 224, device=device)
-        with torch.no_grad():
-            z = clip_model.encode_image(dummy)
-        embed_dim = z.shape[-1]
+        # CLIP embeddings are 512-dim (both visual and text share this space)
+        semantic_layer = stage2.SemanticLayer(hidden_dim=128, n_hidden=2, output_dim=512).to(device)
 
-        semantic_layer = stage2.SemanticLayer(embed_dim=embed_dim, hidden_dim=128, n_hidden=2).to(device)
-        optimizer = torch.optim.Adam(semantic_layer.parameters(), lr=1e-3)
+        # Higher initial learning rate with scheduler for faster convergence
+        optimizer = torch.optim.AdamW(semantic_layer.parameters(), lr=1e-3, weight_decay=1e-4)
 
         transfer_fn = stage2.ParaViewTransferFunction(tf_filename)
 
-        # Closure render_fn that uses Stage 2's differentiable renderer on the Stage 1 INR
+        # Training parameters for global feature matching:
+        # - 160x160 resolution (balanced speed vs quality for global embeddings)
+        # - 32 samples/ray for reasonable speed
+        # - 2048 ray chunk for efficient batching
+        train_resolution = (160, 160)
+        train_samples = 32
+        train_chunk_size = 2048
+
         def render_fn(cam):
             return stage2.differentiable_render_from_inr(
                 grid_inr=model,
                 camera=cam,
-                image_hw=(224, 224),   # render directly at the CLIP input resolution
-                n_samples=64,
+                image_hw=train_resolution,
+                n_samples=train_samples,
                 transfer_function=transfer_fn,
             )
 
-        # Run distillation
-        log = stage2.distill_openclip_to_semantic(
+        log = stage2.train_with_clipseg(
             render_fn=render_fn,
             grid_inr=model,
             semantic_layer=semantic_layer,
-            openclip_encoder=clip_model,
+            clipseg_model=clipseg_model,
             optimizer=optimizer,
-            steps=1000,
-            n_samples=64,
-            clip_input_size=224,
-            keep_grad_through_clip=False,
-            print_every=50,
-            cos_weight=1.0,
-            l2_weight=0.0,
-            # Periodic debug renders help sanity-check Stage 2 training progress.
-            debug_render_every=200,
+            steps=500,
+            image_hw=train_resolution,
+            n_samples=train_samples,
+            print_every=25,
+            ray_chunk_size=train_chunk_size,
+            debug_render_every=50,  # More frequent for monitoring
             debug_render_dir="results/stage2/debug_views",
             debug_num_perspectives=3,
             transfer_function=transfer_fn,
+            use_lr_scheduler=True,
         )
 
-        # Save the semantic head for later use
         import os
         os.makedirs("./models", exist_ok=True)
         torch.save(semantic_layer.state_dict(), "./models/stage2_semantic_head.pth")
-        print("Stage 2 Distillation Completed.")
+
+        # Print training summary
+        print("\nStage 2 Training Completed.")
+        print(f"Final loss: {log['loss'][-1]:.4f}")
+        print(f"Feature loss: {log['feature_loss'][-1]:.4f}")
+        print(f"Min loss achieved: {min(log['loss']):.4f} at step {log['loss'].index(min(log['loss'])) + 1}")
 
 if __name__ == "__main__":
     fire.Fire(main)

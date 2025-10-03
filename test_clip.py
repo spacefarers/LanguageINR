@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import sys
-import math
 from pathlib import Path
 
 import torch
@@ -10,212 +9,101 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
-import open_clip
-
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from models.clipseg import CLIPDensePredT
 
-# ----------------------
-# CLIP sliding-window IO
-# ----------------------
-class ClipLocalizer:
-    def __init__(self, device=None,
-                 model_name="ViT-B-32", pretrained="laion2b_s34b_b79k"):
-        import torch
-        import open_clip
 
+class ClipSegLocalizer:
+    def __init__(self, weights_path="./weights/rd64-uni.pth", device=None):
         if device is None:
-            device = "cuda:1" if torch.cuda.is_available() else "cpu"
-        self.device = device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
 
-        res = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
-        # Handle both old and new open_clip return signatures
-        if isinstance(res, tuple) and len(res) == 3:
-            self.model, _preprocess_train, self.preprocess = res
-        elif isinstance(res, tuple) and len(res) == 2:
-            self.model, self.preprocess = res
-        else:
-            raise RuntimeError(
-                f"Unexpected create_model_and_transforms return: type={type(res)}, len={len(res) if isinstance(res, tuple) else 'n/a'}"
+        weights_path = Path(weights_path).expanduser().resolve()
+        if not weights_path.is_file():
+            raise FileNotFoundError(
+                f"CLIPSeg weights not found at {weights_path}. "
+                f"Download rd64-uni.pth from CLIPSeg repo."
             )
 
-        self.model.eval().to(self.device)
+        self.model = CLIPDensePredT(version="ViT-B/16", reduce_dim=64)
+        state_dict = torch.load(weights_path, map_location=self.device)
+        self.model.load_state_dict(state_dict, strict=False)
+        self.model.eval()
+        self.model = self.model.to(self.device)
+
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    @staticmethod
+    def normalize_image(img_tensor):
+        """ImageNet normalization for CLIPSeg."""
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        return (img_tensor - mean.to(img_tensor.device)) / std.to(img_tensor.device)
 
     @torch.no_grad()
-    def encode_text(self, text: str) -> torch.Tensor:
-        tokens = open_clip.tokenize([text]).to(self.device)
-        t = self.model.encode_text(tokens)
-        t = t / t.norm(dim=-1, keepdim=True)
-        return t  # shape [1, d]
-
-    @torch.no_grad()
-    def encode_patch(self, pil_img: Image.Image) -> torch.Tensor:
-        """Return normalized image embedding for a single patch PIL image."""
-        img = self.preprocess(pil_img).unsqueeze(0).to(self.device)
-        f = self.model.encode_image(img)
-        f = f / f.norm(dim=-1, keepdim=True)
-        return f  # shape [1, d]
-
-    def best_region(
-        self,
-        pil_img_224: Image.Image,
-        text: str,
-        patch_size: int = 64,
-        stride: int = 16,
-    ):
+    def segment(self, pil_img: Image.Image, text: str, out_size: int = 352) -> np.ndarray:
         """
-        Slide a window across the 224x224 image and return:
-          (best_x, best_y, patch_w, patch_h, best_score, score_map)
-        Coordinates are top-left in pixel space of the original 224x224.
-        score_map is a 2D numpy array of similarities for visualization if desired.
+        Run CLIPSeg inference on an image with a text prompt.
+
+        Args:
+            pil_img: PIL Image (any size, will be resized to out_size)
+            text: text description for segmentation
+            out_size: CLIPSeg input resolution
+
+        Returns:
+            segmentation_map: numpy array [H, W] with scores in [0, 1]
         """
-        if pil_img_224.size != (224, 224):
-            raise ValueError(f"Expected image size 224x224, got {pil_img_224.size}")
+        orig_size = pil_img.size
+        if pil_img.size != (out_size, out_size):
+            pil_img = pil_img.resize((out_size, out_size), Image.BICUBIC)
 
-        text_feat = self.encode_text(text)  # [1, d]
+        img_array = np.array(pil_img).astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)
+        img_tensor = self.normalize_image(img_tensor)
+        img_tensor = img_tensor.to(self.device)
 
-        W, H = pil_img_224.size
-        ps = patch_size
-        st = stride
+        prediction = self.model(img_tensor, text)[0]
+        prediction = torch.sigmoid(prediction)
 
-        xs = list(range(0, W - ps + 1, st))
-        ys = list(range(0, H - ps + 1, st))
-        if xs[-1] != W - ps:
-            xs.append(W - ps)
-        if ys[-1] != H - ps:
-            ys.append(H - ps)
+        seg_map = F.interpolate(
+            prediction, size=orig_size[::-1], mode='bilinear', align_corners=False
+        )
+        seg_map = seg_map[0, 0].cpu().numpy()
 
-        score_map = np.zeros((len(ys), len(xs)), dtype=np.float32)
-        best = (-1e9, 0, 0)
+        return seg_map
 
-        for yi, y in enumerate(ys):
-            for xi, x in enumerate(xs):
-                crop = pil_img_224.crop((x, y, x + ps, y + ps))
-                img_feat = self.encode_patch(crop)  # [1, d]
-                sim = float((img_feat @ text_feat.T).item())  # cosine sim
-                score_map[yi, xi] = sim
-                if sim > best[0]:
-                    best = (sim, x, y)
+    def best_region(self, pil_img: Image.Image, text: str, threshold: float = 0.5):
+        """
+        Find the best matching region in the image.
 
-        best_score, bx, by = best
-        return bx, by, ps, ps, best_score, score_map
+        Returns:
+            (bbox_x, bbox_y, bbox_w, bbox_h, best_score, score_map)
+        """
+        seg_map = self.segment(pil_img, text)
 
+        best_score = float(seg_map.max())
 
-@torch.no_grad()
-def clip_patch_heatmap(model, preprocess, pil_img: Image.Image, text: str, device="cuda"):
-    """Return (heatmap, grid_size, bbox, score) for CLIP ViT patch tokens, enhanced with GEM."""
+        binary_mask = (seg_map > threshold).astype(np.uint8)
 
-    device = device if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-    model.eval()
+        if binary_mask.sum() == 0:
+            h, w = seg_map.shape
+            return 0, 0, w, h, best_score, seg_map
 
-    tokens = open_clip.tokenize([text]).to(device)
-    text_feat = model.encode_text(tokens)  # [1, D]
-    text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+        coords = np.column_stack(np.where(binary_mask > 0))
+        if len(coords) > 0:
+            y_min, x_min = coords.min(axis=0)
+            y_max, x_max = coords.max(axis=0)
+            bbox = (int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min))
+        else:
+            h, w = seg_map.shape
+            bbox = (0, 0, w, h)
 
-    img = preprocess(pil_img).unsqueeze(0).to(device)
-
-    visual = model.visual
-    saved_tokens = {}
-
-    def hook_fn(_module, _inputs, output):
-        saved_tokens["tokens"] = output
-
-    handle = visual.transformer.register_forward_hook(hook_fn)
-    _ = model.encode_image(img)
-    handle.remove()
-
-    if "tokens" not in saved_tokens:
-        raise RuntimeError("Failed to capture transformer tokens from CLIP visual encoder.")
-
-    tokens_out = saved_tokens["tokens"]  # [B, 1+N, width]
-    patch_tokens = tokens_out[:, 1:, :]  # [B, N, D]
-    x = patch_tokens.squeeze(0)  # [N, D]
-
-    # GEM implementation starts here
-    last_block = visual.transformer.resblocks[-1]
-    attn = last_block.attn
-    qkv_weight = attn.in_proj_weight.data  # [3*D, D] (changed from qkv.weight to in_proj_weight)
-    dim = visual.embed_dim
-    W_q = qkv_weight[0:dim, :]
-    W_k = qkv_weight[dim:2 * dim, :]
-    W_v = qkv_weight[2 * dim:3 * dim, :]
-
-    n, d = x.shape
-    sum_norms = torch.sum(torch.norm(x, dim=1))
-    tau = n * math.sqrt(d) / sum_norms.item()
-
-    def compute_p_K(W_proj, K=1):
-        p = torch.matmul(x, W_proj.T)
-        p = p / torch.norm(p, dim=-1, keepdim=True)
-        for _ in range(K):
-            sim = torch.matmul(p, p.T) / tau
-            attn = F.softmax(sim, dim=-1)
-            p = torch.matmul(attn, p)
-            p = p / torch.norm(p, dim=-1, keepdim=True)
-        return p
-
-    p_q = compute_p_K(W_q)
-    p_k = compute_p_K(W_k)
-    p_v = compute_p_K(W_v)
-
-    V = torch.matmul(x, W_v.T)
-
-    def compute_O(p, V):
-        sim = torch.matmul(p, p.T) / tau
-        attn = F.softmax(sim, dim=-1)
-        O = torch.matmul(attn, V)
-        return O
-
-    O_q = compute_O(p_q, V)
-    O_k = compute_O(p_k, V)
-    O_v = compute_O(p_v, V)
-
-    O_qkv = (O_q + O_k + O_v) / 3
-
-    # Apply ln_post and proj to refined features
-    patch_feats = visual.ln_post(O_qkv.unsqueeze(0))
-    proj = getattr(visual, "proj", None)
-    if proj is not None:
-        patch_feats = patch_feats @ proj
-    patch_feats = patch_feats / patch_feats.norm(dim=-1, keepdim=True)
-
-    sim = torch.matmul(patch_feats, text_feat.T).squeeze(-1)
-    sim = sim.squeeze(0)  # [N]
-
-    patch_size = getattr(visual, "patch_size", None)
-    if patch_size is None:
-        patch_size = getattr(getattr(visual, "patch_embed", None), "patch_size", None)
-    if isinstance(patch_size, (tuple, list)):
-        patch_h, patch_w = patch_size[:2]
-        if patch_h != patch_w:
-            raise ValueError(f"Non-square patch size unsupported: {patch_size}")
-        patch_size = patch_h
-    if patch_size is None:
-        patch_size = 32
-
-    grid_size = int(round(224 / patch_size))
-    heat = sim.reshape(grid_size, grid_size)
-
-    heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-6)
-    heat_up = F.interpolate(
-        heat.unsqueeze(0).unsqueeze(0),
-        size=(224, 224),
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze().float().cpu().numpy()
-
-    idx = int(torch.argmax(sim).item())
-    iy, ix = divmod(idx, grid_size)
-    bbox = (ix * patch_size, iy * patch_size, patch_size, patch_size)
-    best_score = float(sim.max().item())
-
-    return heat_up, (grid_size, grid_size), bbox, best_score
+        return bbox[0], bbox[1], bbox[2], bbox[3], best_score, seg_map
 
 
-# ----------------------
-# PyQt UI
-# ----------------------
 class ImageView(QtWidgets.QGraphicsView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -224,54 +112,42 @@ class ImageView(QtWidgets.QGraphicsView):
         self.setViewportUpdateMode(QtWidgets.QGraphicsView.FullViewportUpdate)
         self.setBackgroundBrush(QtGui.QBrush(QtGui.QColor(20, 20, 20)))
 
+
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CLIP Region Localizer (open_clip + PyQt5)")
+        self.setWindowTitle("CLIPSeg Region Localizer")
         self.resize(900, 600)
 
-        # State
         self.image_path: Path | None = None
         self.pil_img: Image.Image | None = None
         self.scene = QtWidgets.QGraphicsScene(self)
         self.pixmap_item = None
         self.overlay_rect = None
 
-        # Widgets
         self.view = ImageView()
         self.view.setScene(self.scene)
 
         self.prompt_edit = QtWidgets.QLineEdit()
-        self.prompt_edit.setPlaceholderText("Type a phrase, e.g., 'a cat', 'red ball', 'text on paper' ...")
+        self.prompt_edit.setPlaceholderText("Type a phrase, e.g., 'a cat', 'red ball', 'leaves' ...")
 
-        self.patch_spin = QtWidgets.QSpinBox()
-        self.patch_spin.setRange(16, 224)
-        self.patch_spin.setValue(64)
-        self.patch_spin.setSingleStep(8)
-        self.patch_spin.setPrefix("patch=")
-        self.patch_spin.setEnabled(False)
-        self.patch_spin.setToolTip("Sliding-window controls disabled; using ViT patch heatmap.")
+        self.threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_spin.setRange(0.0, 1.0)
+        self.threshold_spin.setValue(0.5)
+        self.threshold_spin.setSingleStep(0.05)
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setPrefix("threshold=")
 
-        self.stride_spin = QtWidgets.QSpinBox()
-        self.stride_spin.setRange(4, 128)
-        self.stride_spin.setValue(16)
-        self.stride_spin.setSingleStep(4)
-        self.stride_spin.setPrefix("stride=")
-        self.stride_spin.setEnabled(False)
-        self.stride_spin.setToolTip("Sliding-window controls disabled; using ViT patch heatmap.")
-
-        self.open_btn = QtWidgets.QPushButton("Open 224×224 Image…")
+        self.open_btn = QtWidgets.QPushButton("Open Image…")
         self.run_btn = QtWidgets.QPushButton("Find Region")
         self.run_btn.setDefault(True)
         self.status_lbl = QtWidgets.QLabel("Load an image to start.")
         self.status_lbl.setStyleSheet("color: #bbb")
 
-        # Layout
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(self.open_btn)
         controls.addWidget(self.prompt_edit, 1)
-        controls.addWidget(self.patch_spin)
-        controls.addWidget(self.stride_spin)
+        controls.addWidget(self.threshold_spin)
         controls.addWidget(self.run_btn)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -279,15 +155,14 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(self.view, 1)
         layout.addWidget(self.status_lbl)
 
-        # Logic
-        self.localizer = ClipLocalizer()
+        self.localizer = ClipSegLocalizer()
 
         self.open_btn.clicked.connect(self.open_image)
         self.run_btn.clicked.connect(self.run_localization)
 
     def open_image(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open 224×224 image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
+            self, "Open image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
         )
         if not path:
             return
@@ -297,37 +172,20 @@ class MainWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
             return
 
-        if pil.size != (224, 224):
-            # Offer to auto-resize to 224×224 for convenience
-            reply = QtWidgets.QMessageBox.question(
-                self,
-                "Resize?",
-                f"Image is {pil.size}, expected 224×224.\nResize a copy to 224×224?",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            )
-            if reply == QtWidgets.QMessageBox.Yes:
-                pil = pil.resize((224, 224), Image.BICUBIC)
-            else:
-                return
-
         self.image_path = Path(path)
         self.pil_img = pil
         self.set_pixmap(pil)
         self.status_lbl.setText(f"Loaded {self.image_path.name} ({pil.size[0]}×{pil.size[1]}).")
 
     def set_pixmap(self, pil_img: Image.Image):
-        # Clear scene
         self.scene.clear()
         self.overlay_rect = None
 
-        # Convert PIL to QPixmap
         qimg = self.pil2qimage(pil_img)
         pm = QtGui.QPixmap.fromImage(qimg)
         self.pixmap_item = self.scene.addPixmap(pm)
-        # QGraphicsScene expects QRectF, while QPixmap.rect() returns QRect
         self.scene.setSceneRect(QtCore.QRectF(pm.rect()))
 
-        # Center view
         self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
 
     def resizeEvent(self, event):
@@ -344,7 +202,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def run_localization(self):
         if self.pil_img is None:
-            QtWidgets.QMessageBox.information(self, "No image", "Please open a 224×224 image first.")
+            QtWidgets.QMessageBox.information(self, "No image", "Please open an image first.")
             return
 
         phrase = self.prompt_edit.text().strip()
@@ -354,16 +212,9 @@ class MainWindow(QtWidgets.QWidget):
 
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
-            base_img = self.pil_img
-            if base_img.size != (224, 224):
-                base_img = base_img.resize((224, 224), Image.BICUBIC)
-
-            heat, (gy, gx), (bx, by, bw, bh), score = clip_patch_heatmap(
-                self.localizer.model,
-                self.localizer.preprocess,
-                base_img,
-                phrase,
-                device=self.localizer.device,
+            threshold = self.threshold_spin.value()
+            bx, by, bw, bh, score, heat = self.localizer.best_region(
+                self.pil_img, phrase, threshold=threshold
             )
         except Exception as e:
             QtWidgets.QApplication.restoreOverrideCursor()
@@ -373,28 +224,29 @@ class MainWindow(QtWidgets.QWidget):
             QtWidgets.QApplication.restoreOverrideCursor()
 
         heat = np.clip(heat, 0.0, 1.0)
+        h, w = heat.shape
         heat_img = (255 * heat).astype(np.uint8)
-        alpha = np.clip((heat * 180.0), 0.0, 255.0).astype(np.uint8)
+        alpha = np.clip((heat * 200.0), 0.0, 255.0).astype(np.uint8)
 
-        rgba_arr = np.zeros((224, 224, 4), dtype=np.uint8)
+        rgba_arr = np.zeros((h, w, 4), dtype=np.uint8)
         rgba_arr[..., 0] = heat_img
         rgba_arr[..., 3] = alpha
         heat_overlay = Image.fromarray(rgba_arr, mode="RGBA")
 
-        base_rgba = base_img.convert("RGBA")
+        base_rgba = self.pil_img.convert("RGBA")
+        if base_rgba.size != (w, h):
+            base_rgba = base_rgba.resize((w, h), Image.BICUBIC)
         composite = Image.alpha_composite(base_rgba, heat_overlay)
 
         self.set_pixmap(composite.convert("RGB"))
         self.draw_overlay_rect(bx, by, bw, bh)
 
         self.status_lbl.setText(
-            f"Best patch {gx}x{gy} grid at (x={bx}, y={by}, w={bw}, h={bh}) — cosine {score:.4f}"
+            f"Best region at (x={bx}, y={by}, w={bw}, h={bh}) — score {score:.4f}"
         )
 
     def draw_overlay_rect(self, x, y, w, h):
-        # Remove previous overlay if any
         for item in self.scene.items():
-            # Keep the pixmap; remove any rectangles we added
             if isinstance(item, QtWidgets.QGraphicsRectItem):
                 self.scene.removeItem(item)
 
@@ -402,13 +254,12 @@ class MainWindow(QtWidgets.QWidget):
         pen = QtGui.QPen(QtGui.QColor(255, 50, 50))
         pen.setWidth(2)
         rect_item.setPen(pen)
-        brush = QtGui.QBrush(QtGui.QColor(255, 50, 50, 60))  # translucent fill
+        brush = QtGui.QBrush(QtGui.QColor(255, 50, 50, 60))
         rect_item.setBrush(brush)
         rect_item.setZValue(10)
         self.scene.addItem(rect_item)
         self.overlay_rect = rect_item
 
-        # Keep view fitted
         self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
 
 

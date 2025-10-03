@@ -8,13 +8,13 @@ import json
 
 
 machine = platform.node()
-device = torch.device('cuda:1')
+device = torch.device('cuda')
 batch_size = 1
 
-VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/lobster_301x324x56_uint8_normalized_float32.raw"
-VOLUME_DIMS = [301, 324, 56]
-# VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/bonsai_256x256x256_uint8_float32_normalized.raw"
-# VOLUME_DIMS = [256, 256, 256]
+# VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/lobster_301x324x56_uint8_normalized_float32.raw"
+# VOLUME_DIMS = [301, 324, 56]
+VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/bonsai_256x256x256_uint8_float32_normalized.raw"
+VOLUME_DIMS = [256, 256, 256]
 np_dtype = np.float32
 dtype = torch.float32
 
