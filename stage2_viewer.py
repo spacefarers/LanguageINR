@@ -18,18 +18,18 @@ Design goals
 Key references (code this module relies on)
 -------------------------------------------
 - stage2.py: differentiable sampling of the INR, CLIPSeg utilities, and the
-  SemanticLayer definition (512‑D features). We rely on the shared embedding space
+  LangSemanticLayer definition (512‑D features). We rely on the shared embedding space
   (visual/text) to compare per‑voxel semantic features with CLIP text embeddings.
 - render.py: Camera and render_with_nerfacc renderer.
 - model.py: NGP_TCNN hash‑grid INR.
 
 Usage
 -----
-CLI (no GUI):
-    python stage2_viewer.py --phrase "thin branches" --save out.png
+Default (GUI if available, otherwise CLI):
+    python stage2_viewer.py
 
-GUI (if PyQt5 is available):
-    python stage2_viewer.py --gui
+CLI mode (explicit):
+    python stage2_viewer.py --cli --phrase "thin branches" --save out.png
 
 Common flags:
     --stage1 ./models/stage1_ngp_tcnn.pth
@@ -56,14 +56,14 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 # Project imports
-from config import device, opt, dtype  # type: ignore
+from config import device, opt, dtype, TRANSFER_FUNCTION_PATH  # type: ignore
 from model import NGP_TCNN  # type: ignore
 from render import Camera, render_with_nerfacc  # type: ignore
 import stage2  # type: ignore
@@ -73,10 +73,10 @@ import stage2  # type: ignore
 # Constants / Defaults
 # ------------------------------
 
-STAGE1_PATH_DEFAULT = "./models/stage1_ngp_tcnn.pth"
-STAGE2_HEAD_DEFAULT = "./models/stage2_semantic_head.pth"
+STAGE1_PATH_DEFAULT    = "./models/stage1_ngp_tcnn.pth"
+STAGE2_HEAD_DEFAULT    = "./models/stage2_semantic_head.pth"
 CLIPSEG_WEIGHTS_DEFAULT = "./weights/rd64-uni.pth"
-TRANSFER_FUNCTION_DEFAULT = "./paraview_tf/bonsai.json"
+TRANSFER_FUNCTION_DEFAULT = TRANSFER_FUNCTION_PATH  # Imported from config.py
 
 
 # ------------------------------
@@ -90,15 +90,6 @@ def _ensure(cond: bool, msg: str):
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
-
-
-def _dense_coords(Dv: int, Hv: int, Wv: int, on_device: torch.device) -> torch.Tensor:
-    """[D,H,W,3] coordinates in [-1,1] for INR sampling."""
-    z = torch.linspace(-1, 1, Dv, device=on_device, dtype=torch.float32)
-    y = torch.linspace(-1, 1, Hv, device=on_device, dtype=torch.float32)
-    x = torch.linspace(-1, 1, Wv, device=on_device, dtype=torch.float32)
-    zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
-    return torch.stack([xx, yy, zz], dim=-1)  # [D,H,W,3]
 
 
 def _normalize(t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -145,11 +136,16 @@ class VolumeSemanticSearcher:
         self.clipseg = stage2.load_clipseg_model(clipseg_weights, model_device=device)
         self.clipseg.eval()
 
-        # ---- Stage‑2 semantic head ----
-        self.embed_dim = 512
+        # ---- Stage‑2 semantic head (latent) ----
         _ensure(os.path.exists(stage2_head_path), f"Missing Stage‑2 head at {stage2_head_path}")
-        self.semantic = stage2.SemanticLayer(hidden_dim=128, n_hidden=2, output_dim=self.embed_dim).to(device)
-        self.semantic.load_state_dict(torch.load(stage2_head_path, map_location=device))
+        head_state = torch.load(stage2_head_path, map_location="cpu")
+        def _infer_latent_dim(state_dict: Dict[str, torch.Tensor]) -> int:
+            dims = [tensor.shape[0] for key, tensor in state_dict.items() if key.startswith("head_s.") and key.endswith("weight")]
+            _ensure(len(dims) > 0, "Unable to infer latent dimension from Stage-2 head state dict")
+            return int(min(dims))
+        self.latent_dim = _infer_latent_dim(head_state)
+        self.semantic = stage2.LangSemanticLayer(hidden_dim=256, n_hidden=3, d=self.latent_dim).to(device)
+        self.semantic.load_state_dict(head_state)
         self.semantic.eval()
 
         # ---- Transfer function ----
@@ -170,12 +166,11 @@ class VolumeSemanticSearcher:
             return self._v_norm
 
         Dv, Hv, Wv = self._Dv, self._Hv, self._Wv
-        coords = _dense_coords(Dv, Hv, Wv, device).view(-1, 3)
+        coords = stage2._dense_coords_for_inr(Dv, Hv, Wv, device).view(-1, 3)
         v = self.grid_inr(coords).view(Dv, Hv, Wv, 1)
-        v_min = float(v.min().item())
-        v_max = float(v.max().item())
-        denom = max(v_max - v_min, 1e-8)
-        v_norm = ((v - v_min) / denom).clamp(0, 1).contiguous()
+        v_min = self.grid_inr.min().to(v.dtype)
+        v_max = self.grid_inr.max().to(v.dtype)
+        v_norm = ((v - v_min) / (v_max - v_min + 1e-8)).clamp(0, 1).contiguous()
         self._v_norm = v_norm
         return self._v_norm
 
@@ -216,10 +211,13 @@ class VolumeSemanticSearcher:
 
         # Keep text embedding on device; half precision is fine for dot-product
         z_text = _normalize(z_text).to(device=device, dtype=torch.float16)
+        # canonical negatives for LERF-style relevancy
+        canon_phrases = ["object", "things", "stuff", "texture"]
+        canon = [self.encode_text(p).to(torch.float16) for p in canon_phrases]
 
-        xs = torch.linspace(-1, 1, Wv, device=device, dtype=torch.float32)
-        ys = torch.linspace(-1, 1, Hv, device=device, dtype=torch.float32)
-        zs = torch.linspace(-1, 1, Dv, device=device, dtype=torch.float32)
+        x_coords = torch.linspace(-1, 1, Wv, device=device, dtype=torch.float32)
+        y_coords = torch.linspace(-1, 1, Hv, device=device, dtype=torch.float32)
+        z_coords = torch.linspace(-1, 1, Dv, device=device, dtype=torch.float32)
 
         v_norm_full = self._ensure_scalar_field()  # [D,H,W,1]
 
@@ -235,7 +233,7 @@ class VolumeSemanticSearcher:
         S = torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32)
 
         # Prebuild base (y,x) grid to avoid re‑allocations
-        yy_base, xx_base = torch.meshgrid(ys, xs, indexing="ij")
+        yy_base, xx_base = torch.meshgrid(y_coords, x_coords, indexing="ij")
         yy_base = yy_base.unsqueeze(0)  # [1,H,W]
         xx_base = xx_base.unsqueeze(0)  # [1,H,W]
 
@@ -247,43 +245,52 @@ class VolumeSemanticSearcher:
             c1 = min(Dv, end + pad)
             depth = c1 - c0
 
-            z_chunk = zs[c0:c1].view(-1, 1, 1).expand(-1, Hv, Wv)  # [depth,H,W]
+            z_chunk = z_coords[c0:c1].view(-1, 1, 1).expand(-1, Hv, Wv)  # [depth,H,W]
             yy = yy_base.expand(depth, -1, -1)                     # [depth,H,W]
             xx = xx_base.expand(depth, -1, -1)                     # [depth,H,W]
             coords = torch.stack([xx, yy, z_chunk], dim=-1).reshape(-1, 3)  # [N,3]
 
             # Per-voxel semantic features
             v_chunk = v_norm_full[c0:c1].reshape(-1, 1)
-            feats = self.semantic.forward_per_sample(coords, v_chunk)        # [N,512]
-            feats = _normalize(feats, eps=1e-6).to(dtype=torch.float16)
-            feats = feats.view(depth, Hv, Wv, self.embed_dim)                # [D,H,W,C]
+            zs, zp, zw = self.semantic.forward_per_sample(coords, v_chunk)  # [N,d] x3
+            ds = _normalize(zs, eps=1e-6).to(dtype=torch.float16)
+            dp = _normalize(zp, eps=1e-6).to(dtype=torch.float16)
+            dw = _normalize(zw, eps=1e-6).to(dtype=torch.float16)
+            d_feat = self.latent_dim
+            ds = ds.view(depth, Hv, Wv, d_feat)
+            dp = dp.view(depth, Hv, Wv, d_feat)
+            dw = dw.view(depth, Hv, Wv, d_feat)
 
             # Optional local aggregation (3D average pool)
             if pad > 0:
-                # [N,C,D,H,W] for pooling
-                vol = feats.permute(3, 0, 1, 2).unsqueeze(0)  # [1,512,depth,H,W]
-                # If chunk smaller than kernel, shrink kernel to fit
-                kD = min(kernel, depth)
-                kH = min(kernel, Hv)
-                kW = min(kernel, Wv)
-                pD = (kD - 1) // 2
-                pH = (kH - 1) // 2
-                pW = (kW - 1) // 2
-                vol = F.avg_pool3d(vol, kernel_size=(kD, kH, kW), stride=1, padding=(pD, pH, pW))
-                feats = vol.squeeze(0).permute(1, 2, 3, 0)  # [depth,H,W,512]
-                feats = _normalize(feats, eps=1e-6)
+                # aggregate each level
+                def _pool(vol4):
+                    vol = vol4.permute(3, 0, 1, 2).unsqueeze(0)  # [1,512,depth,H,W]
+                    kD = min(kernel, depth)
+                    kH = min(kernel, Hv)
+                    kW = min(kernel, Wv)
+                    pD = (kD - 1) // 2
+                    pH = (kH - 1) // 2
+                    pW = (kW - 1) // 2
+                    vol = F.avg_pool3d(vol, kernel_size=(kD, kH, kW), stride=1, padding=(pD, pH, pW))
+                    return _normalize(vol.squeeze(0).permute(1, 2, 3, 0), eps=1e-6)
+                ds, dp, dw = _pool(ds), _pool(dp), _pool(dw)
 
             # Strip padded rows to keep only [start:end]
             s_off = start - c0
             e_off = s_off + (end - start)
-            feats_valid = feats[s_off:e_off]  # [end-start,H,W,512]
-
-            # Cosine similarity with text embedding (dot product on normalized features)
-            sim = torch.sum(feats_valid * z_text.view(1, 1, 1, -1), dim=-1, dtype=torch.float32)  # [dz,H,W]
-            S[start:end] = sim
+            ds = ds[s_off:e_off]
+            dp = dp[s_off:e_off]
+            dw = dw[s_off:e_off]
+            # relevancy with canonical negatives; take best hierarchy level
+            def _rel(x):  # x:[dz,H,W,d]
+                x = x.view(-1, d_feat)
+                return stage2.relevancy_score(x, z_text, canon).view(-1, Hv, Wv)
+            r_s, r_p, r_w = _rel(ds), _rel(dp), _rel(dw)
+            S[start:end] = torch.maximum(r_w, torch.maximum(r_s, r_p))
 
             # free chunk locals
-            del coords, v_chunk, feats, feats_valid, z_chunk, yy, xx
+            del coords, v_chunk, ds, dp, dw, z_chunk, yy, xx
 
         # Cache
         self._S = S.contiguous()
@@ -293,7 +300,7 @@ class VolumeSemanticSearcher:
         d = flat_idx // (Hv * Wv)
         h = (flat_idx % (Hv * Wv)) // Wv
         w = flat_idx % Wv
-        self._argmax_norm = torch.stack([xs[w], ys[h], zs[d]])  # (x,y,z) in [-1,1]
+        self._argmax_norm = torch.stack([x_coords[w], y_coords[h], z_coords[d]])  # (x,y,z) in [-1,1]
 
     # --------- Rendering ---------
 
@@ -328,10 +335,10 @@ class VolumeSemanticSearcher:
             cx = (self._argmax_norm[0].item() + 1) * 0.5 * (Wv - 1)
             cy = (self._argmax_norm[1].item() + 1) * 0.5 * (Hv - 1)
             cz = (self._argmax_norm[2].item() + 1) * 0.5 * (Dv - 1)
-            xs = torch.arange(Wv, device=device, dtype=rgba.dtype)
-            ys = torch.arange(Hv, device=device, dtype=rgba.dtype)
-            zs = torch.arange(Dv, device=device, dtype=rgba.dtype)
-            zz, yy, xx = torch.meshgrid(zs, ys, xs, indexing="ij")
+            x_blob = torch.arange(Wv, device=device, dtype=rgba.dtype)
+            y_blob = torch.arange(Hv, device=device, dtype=rgba.dtype)
+            z_blob = torch.arange(Dv, device=device, dtype=rgba.dtype)
+            zz, yy, xx = torch.meshgrid(z_blob, y_blob, x_blob, indexing="ij")
             d2 = (xx - cx) ** 2 + (yy - cy) ** 2 + (zz - cz) ** 2
             blob = torch.exp(-d2 / (2.0 * (blob_radius_vox ** 2 + 1e-12))).unsqueeze(-1)
             M = M * blob
@@ -732,7 +739,7 @@ def main(argv=None) -> int:
     p.add_argument("--blob", type=float, default=0.0, help="Optional Gaussian blob radius around argmax (voxels)")
     p.add_argument("--phrase", type=str, default="", help="Text phrase to search for (CLI mode)")
     p.add_argument("--save", type=str, default="viewer_out.png", help="Path to save rendered image (CLI mode)")
-    p.add_argument("--gui", action="store_true", help="Launch interactive Qt viewer (if available)")
+    p.add_argument("--cli", action="store_true", help="Force CLI mode (skip GUI)")
     args = p.parse_args(argv)
 
     searcher = VolumeSemanticSearcher(
@@ -743,10 +750,15 @@ def main(argv=None) -> int:
         default_res_hw=(args.res, args.res),
     )
 
-    if args.gui:
-        return _try_launch_gui(args, searcher)
+    # Try GUI by default unless --cli is specified
+    if not args.cli:
+        result = _try_launch_gui(args, searcher)
+        if result == 0:  # GUI launched successfully
+            return result
+        # If GUI failed (returns 1), fall through to CLI mode
+        print("[viewer] Falling back to CLI mode...")
 
-    # CLI fallback: render one image
+    # CLI mode: render one image
     orbit = _default_orbit(searcher)
     cam = _build_camera(orbit)
 

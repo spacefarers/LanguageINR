@@ -3,3 +3,8 @@
 .vscode
 __pycache__
 keys.py
+*.pkl
+*.png
+.neptune
+*.pt
+*.pth

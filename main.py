@@ -1,6 +1,7 @@
 import fire
-from config import device, VOLUME_DIMS, dtype, np_dtype
+from config import device, VOLUME_DIMS, dtype, np_dtype, TRANSFER_FUNCTION_PATH
 import stage1
+import os
 import render
 from model import NGP_TCNN
 import torch
@@ -17,10 +18,10 @@ if not _volume_info['exists']:
 _x, _y, _z = _volume_info['dims']
 D, H, W = int(_z), int(_y), int(_x)
 
-tf_filename = "./paraview_tf/bonsai.json"
+tf_filename = TRANSFER_FUNCTION_PATH
 
 
-def main(mode="stage2"):
+def main(mode="all"):
     if mode == "stage1" or mode == "all":
         print("Starting Stage 1 Training...")
         model, vol = stage1.train_stage1_model(num_epochs=50, lr=1e-3)
@@ -45,27 +46,60 @@ def main(mode="stage2"):
             print(f"Camera {i + 1:2d} | Azimuth: {cam.azi * 180 / np.pi:5.1f}° | Polar: {cam.polar * 180 / np.pi:5.1f}° | Position: ({pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f})")
 
     if mode == "stage2" or mode == "all":
-        print("Starting Stage 2 Training with CLIPSeg...")
+        print("Starting Stage 2 Training (SAM hierarchy + AE)...")
         import stage2
+        import keys
+        import neptune
 
-        clipseg_weights_path = "./weights/rd64-uni.pth"
-        clipseg_model = stage2.load_clipseg_model(clipseg_weights_path, model_device=device)
+        # Initialize Neptune
+        run = neptune.init_run(
+            project=keys.PROJECT,
+            api_token=keys.NEPTUNE_API_TOKEN,
+            tags=["stage2", "lobster", "sam2-large", "32x32-grid"],
+        )
+        params = {
+            "stage": "stage2",
+            "dataset": "lobster",
+            "volume_dims": tuple(int(x) for x in VOLUME_DIMS),
+            "sam_model": "sam2-large",
+            "sam_points_per_side": 32,
+            "sam_points_per_batch": 64,
+            "sam_pred_iou_thresh": 0.3,
+            "sam_stability_thresh": 0.86,
+            "sam_box_nms_thresh": 0.9,
+            "clipseg_model": "ViT-B/16",
+            "hidden_dim": 256,
+            "n_hidden": 3,
+            "latent_dim": 512,
+            "lr_semantic": 5e-5,
+            "lr_ae": 5e-3,
+            "weight_decay_semantic": 1e-4,
+            "steps": 500,
+            "image_h": 160,
+            "image_w": 160,
+            "n_samples": 32,
+            "cache_size": 20,
+        }
+        run["parameters"] = {k: (v if isinstance(v, (int, float, bool, str)) else str(v)) for k, v in params.items()}
 
-        # CLIP embeddings are 512-dim (both visual and text share this space)
-        semantic_layer = stage2.SemanticLayer(hidden_dim=128, n_hidden=2, output_dim=512).to(device)
-
-        # Higher initial learning rate with scheduler for faster convergence
-        optimizer = torch.optim.AdamW(semantic_layer.parameters(), lr=1e-3, weight_decay=1e-4)
-
+        clipseg_model = stage2.load_clipseg_model("./weights/rd64-uni.pth", model_device=device)
         transfer_fn = stage2.ParaViewTransferFunction(tf_filename)
+        latent_dim = params["latent_dim"]
+        semantic_layer = stage2.LangSemanticLayer(hidden_dim=256, n_hidden=3, d=latent_dim).to(device)
+        opt_sem = torch.optim.AdamW(semantic_layer.parameters(), lr=5e-3, weight_decay=1e-4)
+        sam_gen = stage2.build_sam_generator(
+            model_size="large",              # Using SAM 2 large for best quality
+            sam_device=device,
+            points_per_side=32,              # More points = better coverage
+            points_per_batch=64,             # Process in batches for speed
+            pred_iou_thresh=0.3,             # Loosen thresholds for volumetric renders
+            stability_score_thresh=0.86,
+            box_nms_thresh=0.9,
+        )
 
-        # Training parameters for global feature matching:
-        # - 160x160 resolution (balanced speed vs quality for global embeddings)
-        # - 32 samples/ray for reasonable speed
-        # - 2048 ray chunk for efficient batching
         train_resolution = (160, 160)
         train_samples = 32
-        train_chunk_size = 2048
+        train_chunk_size = 1024  # Reduced from 2048 to save memory
 
         def render_fn(cam):
             return stage2.differentiable_render_from_inr(
@@ -76,33 +110,37 @@ def main(mode="stage2"):
                 transfer_function=transfer_fn,
             )
 
-        log = stage2.train_with_clipseg(
+        log = stage2.train_with_sam_hierarchy(
             render_fn=render_fn,
             grid_inr=model,
             semantic_layer=semantic_layer,
             clipseg_model=clipseg_model,
-            optimizer=optimizer,
+            optimizer_sem=opt_sem,
+            sam_generator=sam_gen,
             steps=500,
             image_hw=train_resolution,
             n_samples=train_samples,
             print_every=25,
             ray_chunk_size=train_chunk_size,
-            debug_render_every=50,  # More frequent for monitoring
+            debug_render_every=50,
             debug_render_dir="results/stage2/debug_views",
             debug_num_perspectives=3,
             transfer_function=transfer_fn,
-            use_lr_scheduler=True,
+            neptune_run=run,
+            cache_size=20,  # Pre-compute SAM for 20 views to eliminate bottleneck
         )
 
-        import os
         os.makedirs("./models", exist_ok=True)
         torch.save(semantic_layer.state_dict(), "./models/stage2_semantic_head.pth")
 
         # Print training summary
         print("\nStage 2 Training Completed.")
-        print(f"Final loss: {log['loss'][-1]:.4f}")
-        print(f"Feature loss: {log['feature_loss'][-1]:.4f}")
-        print(f"Min loss achieved: {min(log['loss']):.4f} at step {log['loss'].index(min(log['loss'])) + 1}")
+        print(f"Final loss: {log['loss'][-1]:.4f}  (lang={log['lang'][-1]:.4f})")
+        print(f"Min total loss: {min(log['loss']):.4f}")
+
+        # Stop Neptune run
+        run.stop()
+        print("Neptune logging stopped.")
 
 if __name__ == "__main__":
     fire.Fire(main)

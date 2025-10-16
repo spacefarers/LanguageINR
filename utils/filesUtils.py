@@ -49,7 +49,7 @@ def isExistDir(dir_path):
     return os.path.exists(dir_path)
 
 def DictPath2DictDir(winPaths):
-    #TODO: no idea what this function does
+    """Convert a dict of file paths to a dict of directory paths."""
     dirRes = {}
     for var,Path in winPaths.items():
         dirRes[var]=os.path.split(Path)[0]

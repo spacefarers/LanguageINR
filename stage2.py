@@ -1,888 +1,645 @@
-# stage2.py
-# Stage 2: CLIPSeg-driven semantic training for a grid INR
-#
-# - Differentiable renderer that samples a trained grid INR along camera rays
-# - CLIPSeg generates text-conditional segmentation maps from rendered images
-# - A semantic layer predicts per-voxel semantic scores from (x,y,z,v)
-# - Training loop matches semantic predictions to CLIPSeg outputs
-#
-# The grid INR is assumed to be the Stage 1 model (e.g., NGP_TCNN) trained on the volume.
-
+# stage2.py — SAM hierarchy + scene autoencoder + latent 3‑head semantic layer
 from typing import Tuple, Optional, Dict, Any, Callable, List
-import os
-import math
-import random
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import imageio
+import os, math, random, numpy as np, torch, torch.nn as nn, torch.nn.functional as F, imageio
 from pathlib import Path
 from tqdm import tqdm
-
 import render
 from config import device
 from render import Camera
+from torch.cuda.amp import autocast, GradScaler
 
-
-# ----------------------------
-# Utilities
-# ----------------------------
-
-
+# ---------- Transfer function / misc ----------
 class ParaViewTransferFunction:
-    """Piecewise-linear transfer function derived from a ParaView JSON file."""
-
     def __init__(self, tf_path: str):
         opacity_points, color_points = render.parse_paraview_tf(tf_path)
         opacity = torch.from_numpy(opacity_points).float()
         color = torch.from_numpy(color_points).float()
-
         opacity = opacity[torch.argsort(opacity[:, 0])]
         color = color[torch.argsort(color[:, 0])]
-
-        self._opacity_x = opacity[:, 0].contiguous()
-        self._opacity_v = opacity[:, 1].contiguous()
-        self._color_x = color[:, 0].contiguous()
-        self._color_rgb = color[:, 1:4].contiguous()
-
-        bounds = torch.cat([self._opacity_x, self._color_x])
-        self._x_min = float(bounds.min())
-        self._x_max = float(bounds.max())
+        self._opacity_x, self._opacity_v = opacity[:, 0].contiguous(), opacity[:, 1].contiguous()
+        self._color_x, self._color_rgb = color[:, 0].contiguous(), color[:, 1:4].contiguous()
+        b = torch.cat([self._opacity_x, self._color_x])
+        self._x_min, self._x_max = float(b.min()), float(b.max())
 
     @staticmethod
     def _interp(scalars: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Tensor:
-        idx = torch.bucketize(scalars, xp, right=False)
-        idx = idx.clamp(min=1, max=xp.numel() - 1)
-
-        x0 = xp[idx - 1]
-        x1 = xp[idx]
-        denom = (x1 - x0).clamp_min(1e-6)
-        t = (scalars - x0) / denom
-
-        if fp.dim() == 1:
-            f0 = fp[idx - 1]
-            f1 = fp[idx]
-            return f0 + (f1 - f0) * t
-
-        f0 = fp[idx - 1]
-        f1 = fp[idx]
+        idx = torch.bucketize(scalars, xp, right=False).clamp(1, xp.numel() - 1)
+        x0, x1 = xp[idx - 1], xp[idx]
+        t = (scalars - x0) / (x1 - x0).clamp_min(1e-6)
+        f0, f1 = fp[idx - 1], fp[idx]
+        if fp.dim() == 1: return f0 + (f1 - f0) * t
         return f0 + (f1 - f0) * t.unsqueeze(-1)
 
     def __call__(self, values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if values.ndim == 0:
-            raise ValueError("Transfer function expects at least 1D input")
-        vals = values.detach()
-        work = vals.to(dtype=torch.float32)
-        scalars = work.view(-1).clamp(self._x_min, self._x_max)
-
-        color_x = self._color_x.to(device=device)
-        color_rgb = self._color_rgb.to(device=device)
-        opacity_x = self._opacity_x.to(device=device)
-        opacity_v = self._opacity_v.to(device=device)
-
-        rgb_flat = self._interp(scalars, color_x, color_rgb)
-        opacity_flat = self._interp(scalars, opacity_x, opacity_v)
-
-        if work.shape[-1] == 1:
-            base_shape = work.shape[:-1]
-        else:
-            base_shape = work.shape
-
-        rgb = rgb_flat.view(*base_shape, 3).to(dtype=values.dtype)
-        opacity = opacity_flat.view(*base_shape, 1).to(dtype=values.dtype)
-
-        return rgb, opacity
-
-
-def _rgba_volume_from_inr(
-    grid_inr: nn.Module,
-    transfer_function: Optional[Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]],
-) -> torch.Tensor:
-    """Sample the INR onto a dense grid and apply the transfer function (cached)."""
-    cache_key = id(transfer_function) if transfer_function is not None else "_default"
-    cache = getattr(grid_inr, "_stage2_rgba_cache", None)
-    if cache is None:
-        cache = {}
-        setattr(grid_inr, "_stage2_rgba_cache", cache)
-
-    device = next(grid_inr.parameters()).device
-
-    rgba_cached = cache.get(cache_key)
-    if isinstance(rgba_cached, torch.Tensor) and rgba_cached.device == device:
-        return rgba_cached
-
-    Dv, Hv, Wv = _volume_extents_from_inr(grid_inr)
-    coords = _dense_coords_for_inr(Dv, Hv, Wv, device).view(-1, 3)
-
-    with torch.no_grad():
-        v = grid_inr(coords).view(Dv, Hv, Wv, 1)
-        v_min = grid_inr.min()
-        v_max = grid_inr.max()
-        v_norm = ((v - v_min) / (v_max - v_min + 1e-8)).clamp(0, 1)
-
-    if transfer_function is None:
-        rgb = v_norm.expand(-1, -1, -1, 3)
-        alpha = v_norm
-    else:
-        rgb, alpha = transfer_function(v_norm)
-        if alpha.dim() == 3:
-            alpha = alpha.unsqueeze(-1)
-
-    rgb = rgb.clamp(0, 1)
-    alpha = alpha.clamp(0, 0.999)
-    rgba = torch.cat([rgb, alpha], dim=-1).contiguous()
-
-    cache[cache_key] = rgba
-    return rgba
-
-
-def _clipseg_normalize_bchw(x_bchw: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize image tensor for CLIPSeg (standard ImageNet normalization).
-    x_bchw in [0,1], shape [B,3,H,W] -> normalized for CLIPSeg.
-    """
-    mean = torch.tensor([0.485, 0.456, 0.406], device=x_bchw.device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=x_bchw.device).view(1, 3, 1, 1)
-    return (x_bchw - mean) / std
-
-
-def load_clipseg_model(weights_path: str, model_device: torch.device = None) -> nn.Module:
-    """
-    Load CLIPSeg model with pretrained weights.
-    """
-    from models.clipseg import CLIPDensePredT
-
-    if model_device is None:
-        model_device = device
-
-    weights_path = Path(weights_path).expanduser().resolve()
-    if not weights_path.is_file():
-        raise FileNotFoundError(
-            f"CLIPSeg weights not found at {weights_path}. "
-            f"Download rd64-uni.pth from CLIPSeg repo."
-        )
-
-    model = CLIPDensePredT(version="ViT-B/16", reduce_dim=64)
-    state_dict = torch.load(weights_path, map_location=model_device)
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    model = model.to(model_device)
-
-    for p in model.parameters():
-        p.requires_grad = False
-
-    return model
-
-
-def clipseg_image_encoder(
-    model: nn.Module,
-    image_hw_rgb: torch.Tensor,
-    out_size: int = 352
-) -> torch.Tensor:
-    """
-    Extract CLIP visual embedding from a rendered image (used during training).
-    Returns 512-dim CLIP embedding that lives in the same space as text embeddings.
-
-    Args:
-        model: CLIPSeg model
-        image_hw_rgb: [H,W,3] image in [0,1]
-        out_size: CLIPSeg input resolution (default 352)
-
-    Returns:
-        image_features: [512] CLIP visual embedding
-    """
-    H, W = image_hw_rgb.shape[0:2]
-
-    img_tensor = image_hw_rgb.permute(2, 0, 1).unsqueeze(0)
-
-    if (H, W) != (out_size, out_size):
-        img_tensor = F.interpolate(img_tensor, size=(out_size, out_size),
-                                   mode='bicubic', align_corners=False)
-
-    img_tensor = _clipseg_normalize_bchw(img_tensor)
-
-    param = next(model.parameters(), None)
-    if param is not None:
-        img_tensor = img_tensor.to(device=param.device, dtype=param.dtype)
-
-    with torch.no_grad():
-        # Extract global CLIP visual embedding (512-dim)
-        # This is in the same embedding space as text encodings
-        visual_features, _, _ = model.visual_forward(img_tensor, extract_layers=[])
-
-    return visual_features.squeeze(0)  # [512]
-
-
-def clipseg_spatial_visual_features(
-    model: nn.Module,
-    image_hw_rgb: torch.Tensor,
-    out_size: int = 352
-) -> torch.Tensor:
-    """
-    Extract spatial CLIP visual features from a rendered image (per-patch embeddings).
-    These spatial features live in the same space as text embeddings due to CLIP's design.
-
-    Args:
-        model: CLIPSeg model
-        image_hw_rgb: [H,W,3] image in [0,1]
-        out_size: CLIPSeg input resolution (default 352)
-
-    Returns:
-        spatial_features: [H_patches, W_patches, 512] spatial visual features
-                         For ViT-B/16 with 352x352: [22, 22, 512]
-    """
-    H, W = image_hw_rgb.shape[0:2]
-
-    img_tensor = image_hw_rgb.permute(2, 0, 1).unsqueeze(0)
-
-    if (H, W) != (out_size, out_size):
-        img_tensor = F.interpolate(img_tensor, size=(out_size, out_size),
-                                   mode='bicubic', align_corners=False)
-
-    img_tensor = _clipseg_normalize_bchw(img_tensor)
-
-    param = next(model.parameters(), None)
-    if param is not None:
-        img_tensor = img_tensor.to(device=param.device, dtype=param.dtype)
-
-    with torch.no_grad():
-        # Extract spatial visual features from the last transformer layer
-        # This gives us per-patch embeddings before the final projection
-        visual_features, activations, _ = model.visual_forward(
-            img_tensor,
-            extract_layers=[len(model.model.transformer.resblocks) - 1]
-        )
-
-        if len(activations) == 0:
-            raise RuntimeError("No activations extracted from visual forward pass")
-
-        # activations[-1]: [L, B, 768] where L = num_patches + 1 (includes CLS token)
-        # Remove CLS token (first token) to get only patch tokens
-        patch_features = activations[-1][1:, :, :]  # [num_patches, B, 768]
-
-        # Apply layer normalization (same as ln_post applied to CLS token)
-        # This is important for matching the CLIP embedding space
-        patch_features = patch_features.permute(1, 0, 2)  # [B, num_patches, 768]
-        if hasattr(model.model, 'ln_post'):
-            # Apply to each patch
-            B, L, D = patch_features.shape
-            patch_features_flat = patch_features.reshape(B * L, D)
-            patch_features_flat = model.model.ln_post(patch_features_flat)
-            patch_features = patch_features_flat.reshape(B, L, D)
-
-        # Project to 512-dim CLIP embedding space (same as text embeddings)
-        if model.model.proj is not None:
-            # Reshape for projection: [B * num_patches, 768]
-            flat_features = patch_features.reshape(-1, patch_features.shape[-1])
-            projected = flat_features @ model.model.proj  # [B * num_patches, 512]
-            patch_features = projected.view(patch_features.shape[0], patch_features.shape[1], -1)
-
-        # Determine patch grid size
-        # For ViT-B/16: 352/16 = 22x22 patches
-        num_patches = patch_features.shape[1]
-        patch_size = int(num_patches ** 0.5)
-
-        # Reshape to spatial grid: [B, num_patches, 512] -> [B, H_patch, W_patch, 512]
-        spatial = patch_features.view(patch_features.shape[0], patch_size, patch_size, -1)
-
-    return spatial.squeeze(0)  # [H_patch, W_patch, 512]
-
-
-def clipseg_inference(
-    model: nn.Module,
-    image_hw_rgb: torch.Tensor,
-    text_prompt: str,
-    out_size: int = 352
-) -> torch.Tensor:
-    """
-    Run CLIPSeg inference on a rendered image with text conditioning (used during inference).
-
-    Args:
-        model: CLIPSeg model
-        image_hw_rgb: [H,W,3] image in [0,1]
-        text_prompt: text description for segmentation
-        out_size: CLIPSeg input resolution (default 352)
-
-    Returns:
-        segmentation_map: [H,W] segmentation scores
-    """
-    H, W = image_hw_rgb.shape[0:2]
-
-    img_tensor = image_hw_rgb.permute(2, 0, 1).unsqueeze(0)
-
-    if (H, W) != (out_size, out_size):
-        img_tensor = F.interpolate(img_tensor, size=(out_size, out_size),
-                                   mode='bicubic', align_corners=False)
-
-    img_tensor = _clipseg_normalize_bchw(img_tensor)
-
-    param = next(model.parameters(), None)
-    if param is not None:
-        img_tensor = img_tensor.to(device=param.device, dtype=param.dtype)
-
-    with torch.no_grad():
-        prediction = model(img_tensor, text_prompt)[0]
-        prediction = torch.sigmoid(prediction)
-
-    seg_map = F.interpolate(prediction, size=(H, W), mode='bilinear', align_corners=False)
-    seg_map = seg_map[0, 0]
-
-    return seg_map
-
-
-def map_ray_features_to_image(
-    ray_features: torch.Tensor,
-    hit_idx: torch.Tensor,
-    image_hw: Tuple[int, int],
-    background_value: float = 0.0
-) -> torch.Tensor:
-    """
-    Scatter per-ray features back to 2D image coordinates.
-
-    Args:
-        ray_features: [N_valid, D] features for rays that hit the volume
-        hit_idx: [N_valid] indices of rays that hit (in flattened H*W space)
-        image_hw: (H, W) image dimensions
-        background_value: value to use for rays that didn't hit the volume
-
-    Returns:
-        image_features: [H, W, D] spatially arranged features
-    """
-    H, W = image_hw
-    D = ray_features.shape[1]
-    device = ray_features.device
-
-    # Initialize output with background value
-    image_features = torch.full((H * W, D), background_value, device=device, dtype=ray_features.dtype)
-
-    # Scatter ray features to their image positions
-    image_features[hit_idx] = ray_features
-
-    # Reshape to 2D image
-    return image_features.view(H, W, D)
-
-
-def _ray_aabb_intersect(origins: torch.Tensor,
-                        dirs: torch.Tensor,
-                        aabb_min: torch.Tensor,
-                        aabb_max: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Vectorized ray-box intersection (slabs).
-    origins, dirs: [N,3]
-    aabb_*: [3]
-    Returns: hit mask [N], t_near [N], t_far [N]
-    """
-    eps = 1e-6
-    inv_d = 1.0 / torch.where(torch.abs(dirs) > eps, dirs, torch.full_like(dirs, eps))
-    t0s = (aabb_min - origins) * inv_d
-    t1s = (aabb_max - origins) * inv_d
-    tmin = torch.minimum(t0s, t1s)
-    tmax = torch.maximum(t0s, t1s)
-    t_near = torch.max(torch.max(tmin[:, 0], tmin[:, 1]), tmin[:, 2])
-    t_far = torch.min(torch.min(tmax[:, 0], tmax[:, 1]), tmax[:, 2])
-    # Clamp near to zero to ignore negative t along the ray
-    t_near = torch.clamp_min(t_near, 0.0)
-    hit = t_far > t_near
-    return hit, t_near, t_far
-
-
-# ----------------------------
-# Differentiable volumetric render from a grid INR
-# ----------------------------
+        vals = values.detach().to(torch.float32).view(-1)
+        rgb = self._interp(vals.clamp(self._x_min, self._x_max), self._color_x.to(device), self._color_rgb.to(device))
+        a = self._interp(vals.clamp(self._x_min, self._x_max), self._opacity_x.to(device), self._opacity_v.to(device))
+        if values.shape[-1] == 1: base = values.shape[:-1]
+        else: base = values.shape
+        return rgb.view(*base, 3).to(values.dtype), a.view(*base, 1).to(values.dtype)
 
 @torch.no_grad()
 def _volume_extents_from_inr(grid_inr) -> Tuple[int, int, int]:
-    """Extract (D,H,W) extents as integers from the INR metadata."""
-    D, H, W = grid_inr.get_volume_extents()
-    return int(D), int(H), int(W)
-
-
+    D, H, W = grid_inr.get_volume_extents(); return int(D), int(H), int(W)
 
 @torch.no_grad()
 def _aabb_from_inr_extents(grid_inr):
     Dv, Hv, Wv = _volume_extents_from_inr(grid_inr)
-    aabb = torch.tensor([0.0, 0.0, 0.0, Wv - 1.0, Hv - 1.0, Dv - 1.0],
-                        device=device, dtype=torch.float32)
-    center = torch.tensor([ (Wv - 1.0) / 2.0,
-                            (Hv - 1.0) / 2.0,
-                            (Dv - 1.0) / 2.0 ], device=device, dtype=torch.float32)
-    size = torch.tensor([Wv - 1.0, Hv - 1.0, Dv - 1.0],
-                        device=device, dtype=torch.float32)
-    return aabb, center, size, (Dv, Hv, Wv)
+    aabb = torch.tensor([0,0,0, Wv-1.0, Hv-1.0, Dv-1.0], device=device, dtype=torch.float32)
+    c = torch.tensor([(Wv-1)/2, (Hv-1)/2, (Dv-1)/2], device=device, dtype=torch.float32)
+    s = torch.tensor([Wv-1, Hv-1, Dv-1], device=device, dtype=torch.float32)
+    return aabb, c, s, (Dv, Hv, Wv)
 
 @torch.no_grad()
-def _dense_coords_for_inr(Dv:int, Hv:int, Wv:int, device):
-    """Returns normalized coords for INR sampling: [Dv, Hv, Wv, 3] in [-1,1]."""
-    z = torch.linspace(-1, 1, steps=Dv, device=device)
-    y = torch.linspace(-1, 1, steps=Hv, device=device)
-    x = torch.linspace(-1, 1, steps=Wv, device=device)
-    zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
-    coords = torch.stack([xx, yy, zz], dim=-1)
-    return coords
+def _dense_coords_for_inr(Dv:int, Hv:int, Wv:int, dev):
+    z = torch.linspace(-1, 1, Dv, device=dev); y = torch.linspace(-1, 1, Hv, device=dev); x = torch.linspace(-1, 1, Wv, device=dev)
+    zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij'); return torch.stack([xx, yy, zz], dim=-1)
 
-
-def differentiable_render_from_inr(
-    grid_inr: nn.Module,
-    camera: Camera,
-    image_hw: Tuple[int, int] = (160, 160),
-    n_samples: int = 64,
-    transfer_function: Optional[Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]] = None,
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """
-    Differentiable renderer that returns auxiliary sampling data for the semantic head
-    while delegating image synthesis to render.render_with_nerfacc for visual fidelity.
-
-    Returns:
-        img_hw: [H,W,3] rendered image
-        aux: dictionary containing:
-            - hit_idx: [N_valid] indices of rays that hit the volume
-            - weights: [N_valid,S] volumetric weights for each sample
-            - coords_norm: [N_valid,S,3] normalized coordinates in [-1,1]
-            - v_norm: [N_valid,S,1] normalized INR values in [0,1]
-            - n_samples: number of samples per ray
-            - image_hw: image dimensions
-    """
-    grid_inr.eval()
-    H, W = image_hw
-
-    aabb, _, _, (Dv, Hv, Wv) = _aabb_from_inr_extents(grid_inr)
-    aabb_min, aabb_max = aabb[:3], aabb[3:]
-
-    dirs = camera.generate_dirs(W, H)
-    dirs = dirs.view(-1, 3)
-
-    eye = camera.position().detach().to(device=device, dtype=torch.float32)
-    origins = eye.unsqueeze(0).expand(dirs.shape[0], 3)
-
-    hit_mask, t_near, t_far = _ray_aabb_intersect(origins, dirs, aabb_min, aabb_max)
-    hit_idx = torch.where(hit_mask)[0]
-    N_valid = hit_idx.numel()
-
-    rgba_volume: Optional[torch.Tensor] = None
-
-    if N_valid == 0:
-        rgba_volume = _rgba_volume_from_inr(grid_inr, transfer_function)
-        img_hw = render.render_with_nerfacc(
-            rgba_volume=rgba_volume,
-            camera=camera,
-            hw=image_hw,
-            spp=None,
-            batch_size=8192,
-        )
-        aux = {
-            "hit_idx": hit_idx,
-            "weights": torch.empty((0, n_samples), device=device),
-            "coords_norm": torch.empty((0, n_samples, 3), device=device),
-            "v_norm": torch.empty((0, n_samples, 1), device=device),
-            "n_samples": n_samples,
-            "image_hw": image_hw,
-        }
-        return img_hw, aux
-
-    origins_valid = origins[hit_idx]
-    dirs_valid = dirs[hit_idx]
-    t_near_valid = t_near[hit_idx]
-    t_far_valid = t_far[hit_idx]
-
-    t_vals = torch.linspace(0, 1, n_samples, device=device).expand(N_valid, n_samples)
-    t_samples = t_near_valid.unsqueeze(-1) + t_vals * (t_far_valid - t_near_valid).unsqueeze(-1)
-
-    sample_points_world = origins_valid.unsqueeze(1) + dirs_valid.unsqueeze(1) * t_samples.unsqueeze(-1)
-
-    coords_norm = 2 * (sample_points_world - aabb_min) / (aabb_max - aabb_min) - 1
-    coords_norm_flat = coords_norm.view(-1, 3)
-
+def _rgba_volume_from_inr(grid_inr: nn.Module, tf: Optional[Callable]) -> torch.Tensor:
+    key = id(tf) if tf is not None else "_default"
+    cache = getattr(grid_inr, "_stage2_rgba_cache", None) or {}
+    setattr(grid_inr, "_stage2_rgba_cache", cache)
+    dev = next(grid_inr.parameters()).device
+    if key in cache and isinstance(cache[key], torch.Tensor) and cache[key].device == dev: return cache[key]
+    Dv, Hv, Wv = _volume_extents_from_inr(grid_inr)
+    coords = _dense_coords_for_inr(Dv, Hv, Wv, dev).view(-1, 3)
     with torch.no_grad():
-        v = grid_inr(coords_norm_flat)
-        v_min = grid_inr.min()
-        v_max = grid_inr.max()
+        v = grid_inr(coords).view(Dv, Hv, Wv, 1)
+        v_min, v_max = grid_inr.min(), grid_inr.max()
         v_norm = ((v - v_min) / (v_max - v_min + 1e-8)).clamp(0, 1)
-
-    v_norm_samples = v_norm.view(N_valid, n_samples, 1)
-
-    if transfer_function is None:
-        gray = v_norm_samples.squeeze(-1)
-        rgb_samples = gray.unsqueeze(-1).expand(-1, -1, 3)
-        alpha_samples = gray
+    if tf is None:
+        rgb, a = v_norm.expand(-1,-1,-1,3), v_norm
     else:
-        rgb_samples, alpha_samples = transfer_function(v_norm_samples)
-        if alpha_samples.dim() == 3:
-            alpha_samples = alpha_samples.squeeze(-1)
+        rgb, a = tf(v_norm);  a = a if a.dim()==4 else a.unsqueeze(-1)
+    rgba = torch.cat([rgb.clamp(0,1), a.clamp(0,0.999)], -1).contiguous()
+    cache[key] = rgba; return rgba
 
-    rgb_samples = rgb_samples.clamp(0, 1)
-    alpha_samples = alpha_samples.clamp(0, 0.999)
+def _clipseg_normalize_bchw(x: torch.Tensor) -> torch.Tensor:
+    m = torch.tensor([0.485,0.456,0.406], device=x.device).view(1,3,1,1)
+    s = torch.tensor([0.229,0.224,0.225], device=x.device).view(1,3,1,1)
+    return (x - m) / s
 
-    dt = torch.diff(t_samples, dim=1, prepend=t_samples[:, :1])
-    sigma = -torch.log1p(-alpha_samples)
-    transmittance = torch.exp(-torch.cumsum(sigma * dt, dim=1))
-    transmittance = torch.cat([torch.ones_like(transmittance[:, :1]), transmittance[:, :-1]], dim=1)
-    weights = transmittance * (1 - torch.exp(-sigma * dt))
+def load_clipseg_model(weights_path: str, model_device: torch.device = None) -> nn.Module:
+    from models.clipseg import CLIPDensePredT
+    model_device = model_device or device
+    p = Path(weights_path).expanduser().resolve()
+    if not p.is_file(): raise FileNotFoundError(f"CLIPSeg weights not found at {p}")
+    model = CLIPDensePredT(version="ViT-B/16", reduce_dim=64)
+    model.load_state_dict(torch.load(p, map_location=model_device), strict=False)
+    model.eval().to(model_device)
+    for t in model.parameters(): t.requires_grad = False
+    return model
 
-    if rgba_volume is None:
-        rgba_volume = _rgba_volume_from_inr(grid_inr, transfer_function)
-    img_hw = render.render_with_nerfacc(
-        rgba_volume=rgba_volume,
-        camera=camera,
-        hw=image_hw,
-        spp=None,
-        batch_size=8192,
-    )
+def clipseg_image_encoder(model: nn.Module, image_hw_rgb: torch.Tensor, out: int = 352) -> torch.Tensor:
+    H, W = image_hw_rgb.shape[:2]
+    x = image_hw_rgb.permute(2,0,1).unsqueeze(0)
+    if (H,W)!=(out,out): x = F.interpolate(x, (out,out), mode='bicubic', align_corners=False)
+    x = _clipseg_normalize_bchw(x).to(next(model.parameters()).device)
+    with torch.no_grad():
+        feat,_,_ = model.visual_forward(x, extract_layers=[])
+    return feat.squeeze(0)  # [512]
 
-    aux = {
-        "hit_idx": hit_idx,
-        "weights": weights,
-        "coords_norm": coords_norm,
-        "v_norm": v_norm_samples,
-        "n_samples": n_samples,
-        "image_hw": image_hw,
-    }
+def clipseg_inference(model: nn.Module, image_hw_rgb: torch.Tensor, text_prompt: str, out: int = 352) -> torch.Tensor:
+    H, W = image_hw_rgb.shape[:2]
+    x = image_hw_rgb.permute(2,0,1).unsqueeze(0)
+    if (H,W)!=(out,out): x = F.interpolate(x, (out,out), mode='bicubic', align_corners=False)
+    x = _clipseg_normalize_bchw(x).to(next(model.parameters()).device)
+    with torch.no_grad(): pred = torch.sigmoid(model(x, text_prompt)[0])
+    return F.interpolate(pred, (H,W), mode='bilinear', align_corners=False)[0,0]
 
-    return img_hw, aux
+def map_ray_features_to_image(ray_features: torch.Tensor, hit_idx: torch.Tensor, image_hw: Tuple[int,int], bg: float = 0.0) -> torch.Tensor:
+    H, W = image_hw; D = ray_features.shape[1]
+    out = torch.full((H*W, D), bg, device=ray_features.device, dtype=ray_features.dtype)
+    out[hit_idx] = ray_features
+    return out.view(H, W, D)
 
+def _ray_aabb_intersect(o: torch.Tensor, d: torch.Tensor, mn: torch.Tensor, mx: torch.Tensor):
+    eps=1e-6; inv = 1.0/torch.where(torch.abs(d)>eps, d, torch.full_like(d, eps))
+    t0=(mn-o)*inv; t1=(mx-o)*inv; tmin=torch.minimum(t0,t1); tmax=torch.maximum(t0,t1)
+    near=torch.clamp_min(torch.max(torch.max(tmin[:,0],tmin[:,1]),tmin[:,2]),0.0); far=torch.min(torch.min(tmax[:,0],tmax[:,1]),tmax[:,2])
+    return far>near, near, far
 
-# ----------------------------
-# Semantic layer
-# ----------------------------
+def differentiable_render_from_inr(grid_inr: nn.Module, camera: Camera, image_hw=(160,160), n_samples=64, transfer_function: Optional[Callable]=None):
+    grid_inr.eval(); H,W=image_hw
+    aabb,_,_,(Dv,Hv,Wv)=_aabb_from_inr_extents(grid_inr); a0,a1=aabb[:3],aabb[3:]
+    dirs=camera.generate_dirs(W,H).view(-1,3); eye=camera.position().detach().to(device=device, dtype=torch.float32)
+    o=eye.unsqueeze(0).expand(dirs.shape[0],3)
+    hit, tn, tf = _ray_aabb_intersect(o, dirs, a0, a1); hit_idx=torch.where(hit)[0]; N=hit_idx.numel()
+    if N==0:
+        rgba=_rgba_volume_from_inr(grid_inr, transfer_function)
+        img=render.render_with_nerfacc(rgba, camera, hw=image_hw, spp=None, batch_size=8192)
+        aux={"hit_idx":hit_idx,"weights":torch.empty((0,n_samples),device=device),"coords_norm":torch.empty((0,n_samples,3),device=device),"v_norm":torch.empty((0,n_samples,1),device=device),"n_samples":n_samples,"image_hw":image_hw}
+        return img, aux
+    o, d, tn, tf = o[hit_idx], dirs[hit_idx], tn[hit_idx], tf[hit_idx]
+    t = torch.linspace(0,1,n_samples,device=device).expand(N,n_samples)
+    ts = tn.unsqueeze(-1)+t*(tf-tn).unsqueeze(-1)
+    pts = o.unsqueeze(1)+d.unsqueeze(1)*ts.unsqueeze(-1)
+    coords = 2*(pts-a0)/(a1-a0)-1
+    with torch.no_grad():
+        v = grid_inr(coords.view(-1,3))
+        v_norm = ((v-grid_inr.min())/(grid_inr.max()-grid_inr.min()+1e-8)).clamp(0,1).view(N,n_samples,1)
+    if transfer_function is None:
+        g=v_norm.squeeze(-1); rgb=g.unsqueeze(-1).expand(-1,-1,3); a=g
+    else:
+        rgb,a = transfer_function(v_norm); a=a.squeeze(-1) if a.dim()==3 else a
+    dt=torch.diff(ts,dim=1,prepend=ts[:,:1]); sigma=-torch.log1p(-a); T=torch.exp(-torch.cumsum(sigma*dt,1)); T=torch.cat([torch.ones_like(T[:,:1]),T[:,:-1]],1); w=T*(1-torch.exp(-sigma*dt))
+    rgba=_rgba_volume_from_inr(grid_inr, transfer_function)
+    img=render.render_with_nerfacc(rgba, camera, hw=image_hw, spp=None, batch_size=8192)
+    aux={"hit_idx":hit_idx,"weights":w,"coords_norm":coords,"v_norm":v_norm,"n_samples":n_samples,"image_hw":image_hw}
+    return img, aux
 
-class SemanticLayer(nn.Module):
+# ---------- SAM 2 hierarchy ----------
+def build_sam_generator(
+    model_size: str = "large",
+    sam_device: Optional[torch.device] = None,
+    points_per_side: int = 32,
+    points_per_batch: int = 64,
+    pred_iou_thresh: float = 0.7,
+    stability_score_thresh: float = 0.92,
+    box_nms_thresh: float = 0.7,
+):
     """
-    Lightweight MLP that predicts per-sample semantic features from (x,y,z,v_norm).
-    Output is aggregated along rays with volumetric weights to produce per-pixel feature vectors.
-    These features are compared to reference image features during training.
-    """
-    def __init__(self, hidden_dim: int = 128, n_hidden: int = 2, output_dim: int = 512):
-        super().__init__()
-        in_dim = 4
-        self.output_dim = output_dim
-        layers = []
-        d = in_dim
-        for _ in range(n_hidden):
-            layers += [nn.Linear(d, hidden_dim), nn.ReLU(inplace=True)]
-            d = hidden_dim
-        layers += [nn.Linear(d, output_dim)]
-        self.mlp = nn.Sequential(*layers)
-
-    def forward_per_sample(self, coords_norm_flat: torch.Tensor, v_norm_flat: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            coords_norm_flat: [N,3] in [-1,1]
-            v_norm_flat: [N,1] in [0,1]
-        Returns:
-            features: [N,output_dim] semantic features
-        """
-        x = torch.cat([coords_norm_flat, v_norm_flat], dim=-1)
-        return self.mlp(x)
-
-    def forward_per_pixel(self, coords_norm: torch.Tensor, v_norm: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """
-        Aggregate per-sample features along rays using volumetric weights.
-
-        Args:
-            coords_norm: [N_rays, N_samples, 3] coordinates
-            v_norm: [N_rays, N_samples, 1] normalized values
-            weights: [N_rays, N_samples] volumetric weights
-        Returns:
-            features: [N_rays, output_dim] per-ray features
-        """
-        N_rays, N_samples = coords_norm.shape[:2]
-        coords_flat = coords_norm.reshape(-1, 3)
-        v_flat = v_norm.reshape(-1, 1)
-
-        # Get per-sample features
-        feats_flat = self.forward_per_sample(coords_flat, v_flat)  # [N_rays*N_samples, output_dim]
-        feats = feats_flat.view(N_rays, N_samples, self.output_dim)  # [N_rays, N_samples, output_dim]
-
-        # Aggregate with volumetric weights
-        weights_expanded = weights.unsqueeze(-1)  # [N_rays, N_samples, 1]
-        aggregated = (feats * weights_expanded).sum(dim=1)  # [N_rays, output_dim]
-
-        return aggregated
-
-
-
-
-# ----------------------------
-# Camera sampling
-# ----------------------------
-
-def _infer_bounds_and_center(
-    grid_inr: "nn.Module",
-) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
-    """
-    Try to read the INR's spatial extent in world units and compute a robust center.
-
-    Supports two common INR conventions:
-    1) get_volume_extents() -> (D, H, W)  sizes only
-    2) get_volume_extents() -> ((xmin, xmax), (ymin, ymax), (zmin, zmax))  bounds
-
-    Returns:
-        (sizes D,H,W), (center_x, center_y, center_z)
-    """
-    ext = grid_inr.get_volume_extents()
-
-    # Case 2: nested bounds like ((xmin,xmax),(ymin,ymax),(zmin,zmax))
-    if isinstance(ext, (list, tuple)) and len(ext) == 3 and all(
-        isinstance(ax, (list, tuple)) and len(ax) == 2 for ax in ext
-    ):
-        (xmin, xmax), (ymin, ymax), (zmin, zmax) = ext
-        W = float(xmax - xmin)
-        H = float(ymax - ymin)
-        D = float(zmax - zmin)
-        cx = float(0.5 * (xmin + xmax))
-        cy = float(0.5 * (ymin + ymax))
-        cz = float(0.5 * (zmin + zmax))
-        return (D, H, W), (cx, cy, cz)
-
-    # Case 1: sizes only (D, H, W)
-    if isinstance(ext, (list, tuple)) and len(ext) == 3:
-        D, H, W = map(float, ext)
-        cx, cy, cz = (W - 1.0) * 0.5, (H - 1.0) * 0.5, (D - 1.0) * 0.5
-        return (D, H, W), (cx, cy, cz)
-
-    # Fallback: try your previous helper if present
-    try:
-        D, H, W = _volume_extents_from_inr(grid_inr)
-        D, H, W = float(D), float(H), float(W)
-        cx, cy, cz = (W - 1.0) * 0.5, (H - 1.0) * 0.5, (D - 1.0) * 0.5
-        return (D, H, W), (cx, cy, cz)
-    except Exception as e:
-        raise RuntimeError(
-            "Could not infer volume bounds from INR. "
-            "Expected sizes (D,H,W) or bounds ((xmin,xmax),(ymin,ymax),(zmin,zmax))."
-        ) from e
-
-
-def sample_random_perspective(
-    grid_inr: "nn.Module",
-    polar_min_deg: float = 20.0,
-    polar_max_deg: float = 160.0,
-    center: Optional[Tuple[float, float, float]] = None,
-    center_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> "Camera":
-    """
-    Sample a random camera on a sphere around the volume.
+    Build SAM 2 automatic mask generator.
 
     Args:
-        grid_inr: trained INR that exposes get_volume_extents()
-        polar_min_deg, polar_max_deg: polar angle range in degrees
-        center: explicit center in world units, computed from INR if None
-        center_offset: world space offset to apply to the center (x, y, z)
-
-    Returns:
-        render.Camera
+        model_size: "tiny", "small", "base_plus", "large" (default)
+        sam_device: Device to run model on
+        points_per_side: Number of points per side in the sampling grid
+        points_per_batch: Number of points to process in parallel
+        pred_iou_thresh: IoU threshold for filtering masks
+        stability_score_thresh: Stability score threshold
+        box_nms_thresh: NMS IoU threshold
     """
-    (Dv, Hv, Wv), inferred_center = _infer_bounds_and_center(grid_inr)
+    try:
+        from sam2.build_sam import build_sam2
+        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    except ImportError:
+        raise ImportError(
+            "SAM 2 not installed. Install with: pip install git+https://github.com/facebookresearch/segment-anything-2.git"
+        )
 
-    cx, cy, cz = center if center is not None else inferred_center
-    ox, oy, oz = center_offset
-    cx += ox
-    cy += oy
-    cz += oz
-    final_center = (cx, cy, cz)
+    sam_device = device if sam_device is None else sam_device
 
-    azi_deg = random.uniform(0.0, 360.0)
+    # Model config mapping (SAM2.1 configs)
+    model_configs = {
+        "tiny": "configs/sam2.1/sam2.1_hiera_t.yaml",
+        "small": "configs/sam2.1/sam2.1_hiera_s.yaml",
+        "base_plus": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+        "large": "configs/sam2.1/sam2.1_hiera_l.yaml",
+    }
 
-    u = random.random()
-    cos_min = math.cos(math.radians(polar_max_deg))
-    cos_max = math.cos(math.radians(polar_min_deg))
-    cos_theta = cos_min + (cos_max - cos_min) * u
-    polar_deg = math.degrees(math.acos(cos_theta))
-    dist = np.sqrt(Dv**2 + Hv**2 + Wv**2)
+    # Checkpoint mapping (assumes checkpoints are in ./checkpoints/)
+    checkpoint_names = {
+        "tiny": "sam2.1_hiera_tiny.pt",
+        "small": "sam2.1_hiera_small.pt",
+        "base_plus": "sam2.1_hiera_base_plus.pt",
+        "large": "sam2.1_hiera_large.pt",
+    }
 
-    return Camera(azi_deg=azi_deg, polar_deg=polar_deg, center=final_center, dist=dist)
+    if model_size not in model_configs:
+        raise ValueError(f"Invalid model_size: {model_size}. Choose from: {list(model_configs.keys())}")
 
+    model_cfg = model_configs[model_size]
+    checkpoint_path = f"checkpoints/{checkpoint_names[model_size]}"
 
+    # Check if checkpoint exists
+    if not os.path.exists(checkpoint_path):
+        print(f"[Stage2][SAM2] Checkpoint not found at {checkpoint_path}")
+        print(f"[Stage2][SAM2] Please download SAM 2 checkpoints from:")
+        print(f"[Stage2][SAM2]   https://github.com/facebookresearch/segment-anything-2#model-checkpoints")
+        print(f"[Stage2][SAM2] And place them in ./checkpoints/")
+        raise FileNotFoundError(f"SAM 2 checkpoint not found: {checkpoint_path}")
 
+    print(f"[Stage2][SAM2] Loading SAM 2 model: {model_size} from {checkpoint_path}")
 
-# ----------------------------
-# CLIPSeg-based training loop
-# ----------------------------
+    # Build SAM 2 model
+    sam2_model = build_sam2(model_cfg, checkpoint_path, device=str(sam_device))
 
-def train_with_clipseg(
-    render_fn,
+    # Create automatic mask generator
+    mask_generator = SAM2AutomaticMaskGenerator(
+        model=sam2_model,
+        points_per_side=points_per_side,
+        points_per_batch=points_per_batch,
+        pred_iou_thresh=pred_iou_thresh,
+        stability_score_thresh=stability_score_thresh,
+        stability_score_offset=0.7,
+        crop_n_layers=1,
+        box_nms_thresh=box_nms_thresh,
+    )
+
+    print(f"[Stage2][SAM2] SAM 2 {model_size} loaded successfully")
+    print(f"[Stage2][SAM2] Config: points_per_side={points_per_side}, points_per_batch={points_per_batch}")
+    print(f"[Stage2][SAM2] Thresholds: iou={pred_iou_thresh}, stability={stability_score_thresh}, nms={box_nms_thresh}")
+
+    return mask_generator
+
+@torch.no_grad()
+def _sam_partition_masks(masks: List[Dict[str,Any]]) -> Dict[str,List[Dict[str,Any]]]:
+    if not masks: return {"s":[], "p":[], "w":[]}
+    areas = np.array([m["area"] for m in masks], dtype=np.float64)
+    lo, hi = float(np.percentile(areas, 33)), float(np.percentile(areas, 66))
+    S, P, W = [], [], []
+    for m in sorted(masks, key=lambda x: (x.get("predicted_iou",0.0), x.get("stability_score",0.0), x["area"]), reverse=True):
+        a = float(m["area"])
+        if a <= lo: S.append(m)
+        elif a <= hi: P.append(m)
+        else: W.append(m)
+    return {"s":S, "p":P, "w":W}
+
+@torch.no_grad()
+def sam_hierarchy_maps(image_hw_rgb: torch.Tensor, sam_gen, clipseg_model: nn.Module, max_regions_per_level: int = 128) -> Dict[str, torch.Tensor]:
+    H,W = image_hw_rgb.shape[:2]
+    img_np = (image_hw_rgb.clamp(0,1).detach().cpu().numpy()*255).astype(np.uint8)
+    masks = sam_gen.generate(img_np)
+    groups = _sam_partition_masks(masks)
+    out: Dict[str, torch.Tensor] = {}
+    for key in ("s","p","w"):
+        L = torch.zeros((H,W,512), device=device, dtype=torch.float32)
+        count = 0
+        for m in groups[key]:
+            if count >= max_regions_per_level: break
+            seg = torch.from_numpy(m["segmentation"]).to(device=device, dtype=torch.float32)
+            if seg.sum() < 8: continue
+            masked = image_hw_rgb * seg.unsqueeze(-1)
+            z = clipseg_image_encoder(clipseg_model, masked)
+            z = F.normalize(z, dim=-1)
+            L[seg>0.5] = z
+            count += 1
+        out[key] = L
+    return out  # keys: s,p,w with [H,W,512]
+
+# ---------- Semantic layer (3 heads, latent d) ----------
+class LangSemanticLayer(nn.Module):
+    def __init__(self, hidden_dim: int = 128, n_hidden: int = 2, d: int = 512):
+        super().__init__()
+        def mlp(in_dim=4):
+            layers, D = [], in_dim
+            for _ in range(n_hidden): layers += [nn.Linear(D, hidden_dim), nn.ReLU(True)]; D = hidden_dim
+            layers += [nn.Linear(D, d)]; return nn.Sequential(*layers)
+        self.head_s, self.head_p, self.head_w = mlp(), mlp(), mlp()
+        self.d = d
+
+    def forward_per_sample(self, coords_flat: torch.Tensor, v_flat: torch.Tensor):
+        x = torch.cat([coords_flat, v_flat], -1)
+        return self.head_s(x), self.head_p(x), self.head_w(x)
+
+    def forward_per_pixel(self, coords: torch.Tensor, v: torch.Tensor, weights: torch.Tensor):
+        N, S = coords.shape[:2]
+        cf, vf = coords.reshape(-1,3), v.reshape(-1,1)
+        zs, zp, zw = self.forward_per_sample(cf, vf)
+        zs, zp, zw = zs.view(N,S,-1), zp.view(N,S,-1), zw.view(N,S,-1)
+        W = weights.unsqueeze(-1)
+        return (zs*W).sum(1), (zp*W).sum(1), (zw*W).sum(1)  # [N,d] x3
+
+# ---------- Camera sampling ----------
+def _infer_bounds_and_center(grid_inr: "nn.Module"):
+    ext = grid_inr.get_volume_extents()
+    if isinstance(ext,(list,tuple)) and len(ext)==3 and all(isinstance(ax,(list,tuple)) and len(ax)==2 for ax in ext):
+        (xmin,xmax),(ymin,ymax),(zmin,zmax)=ext; W,H,D=float(xmax-xmin),float(ymax-ymin),float(zmax-zmin)
+        return (D,H,W), (0.5*(xmin+xmax),0.5*(ymin+ymax),0.5*(zmin+zmax))
+    if isinstance(ext,(list,tuple)) and len(ext)==3:
+        D,H,W=map(float,ext); return (D,H,W), ((W-1)*0.5,(H-1)*0.5,(D-1)*0.5)
+    D,H,W=_volume_extents_from_inr(grid_inr); return (float(D),float(H),float(W)), ((W-1)*0.5,(H-1)*0.5,(D-1)*0.5)
+
+def sample_random_perspective(grid_inr: "nn.Module", polar_min_deg=20.0, polar_max_deg=160.0, center=None, center_offset=(0.0,0.0,0.0)) -> "Camera":
+    (Dv,Hv,Wv), c0 = _infer_bounds_and_center(grid_inr); cx,cy,cz = center or c0; ox,oy,oz = center_offset; cx+=ox; cy+=oy; cz+=oz
+    azi_deg = random.uniform(0.0,360.0)
+    u=random.random(); cos_min=math.cos(math.radians(polar_max_deg)); cos_max=math.cos(math.radians(polar_min_deg))
+    polar_deg = math.degrees(math.acos(cos_min+(cos_max-cos_min)*u))
+    dist = np.sqrt(Dv**2+Hv**2+Wv**2)
+    return Camera(azi_deg=azi_deg, polar_deg=polar_deg, center=(cx,cy,cz), dist=dist)
+
+# ---------- Loss ----------
+def _lat_loss(P: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+    Pn, Tn = F.normalize(P, dim=-1), F.normalize(T, dim=-1)
+    return (P - T).abs().mean() + (1.0 - (Pn * Tn).sum(-1).mean())
+
+def _lat_loss_masked(P: torch.Tensor, T: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+    """
+    Masked latent loss that ignores background pixels with no SAM supervision.
+
+    Args:
+        P: predicted latents [..., d]
+        T: target latents (encoded) [..., d]
+        M: mask broadcastable to [..., 1]; 1.0 = supervised, 0.0 = ignore
+    """
+    eps = torch.finfo(P.dtype).eps if torch.is_floating_point(P) else 1e-6
+    if M.dtype != P.dtype:
+        M = M.to(dtype=P.dtype)
+    mask_sum = M.sum()
+    if mask_sum <= 0:
+        return torch.zeros((), device=P.device, dtype=P.dtype)
+    d = P.shape[-1]
+    Pn = F.normalize(P, dim=-1)
+    Tn = F.normalize(T, dim=-1)
+    l1 = ((P - T).abs() * M.expand_as(P)).sum() / (mask_sum * d + eps)
+    cos = (1.0 - (Pn * Tn).sum(-1)) * M.squeeze(-1)
+    cos = cos.sum() / (mask_sum + eps)
+    return l1 + cos
+
+# ---------- Training (SAM hierarchy) ----------
+def train_with_sam_hierarchy(
+    render_fn: Callable,
     grid_inr: nn.Module,
-    semantic_layer: SemanticLayer,
+    semantic_layer: LangSemanticLayer,
     clipseg_model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer_sem: torch.optim.Optimizer,
     *,
-    steps: int = 1000,
-    image_hw: Tuple[int, int] = (352, 352),
-    n_samples: int = 64,
-    print_every: int = 50,
-    ray_chunk_size: int = 256,
+    sam_generator,
+    steps: int = 500,
+    image_hw: Tuple[int,int] = (160,160),
+    n_samples: int = 32,
+    print_every: int = 25,
+    ray_chunk_size: int = 2048,
+    transfer_function: Optional[Callable] = None,
     debug_render_every: int = 0,
     debug_render_dir: str = "results/stage2/debug",
     debug_num_perspectives: int = 0,
-    transfer_function: Optional[Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]] = None,
-    num_reference_views: int = 3,
-    use_lr_scheduler: bool = True,
+    neptune_run = None,
+    cache_size: int = 50,
+    sam_recompute_every: int = 0,
 ) -> Dict[str, Any]:
-    """
-    Train semantic layer to predict CLIP embeddings (512-dim) that match text embeddings.
-
-    The semantic layer learns to predict CLIP visual embeddings from volumetric features.
-    These embeddings live in the same space as CLIP text embeddings, enabling text-driven
-    3D region search at inference time.
-
-    Args:
-        render_fn: Callable(camera) -> (image, aux)
-        grid_inr: frozen Stage 1 INR model
-        semantic_layer: trainable semantic MLP (should output 512-dim features)
-        clipseg_model: frozen CLIPSeg model for CLIP embeddings
-        optimizer: optimizer for semantic_layer
-        steps: number of training iterations
-        image_hw: render resolution
-        n_samples: samples per ray
-        print_every: logging frequency
-        ray_chunk_size: chunk size for semantic aggregation
-        debug_render_every: debug render frequency
-        debug_render_dir: directory for debug renders
-        debug_num_perspectives: number of fixed debug viewpoints
-        transfer_function: volume transfer function
-        num_reference_views: number of reference views to render per training step
-        use_lr_scheduler: whether to use cosine annealing LR scheduler
-
-    Returns:
-        log: training metrics dictionary
-    """
     grid_inr.eval()
     clipseg_model.eval()
+    semantic_layer.train()
 
-    log = {"loss": [], "feature_loss": []}
+    amp_enabled = device.type == "cuda"
+    scaler_sem = GradScaler(enabled=amp_enabled)
 
-    # Learning rate scheduler for better convergence
-    scheduler = None
-    if use_lr_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-5)
-
-    debug_active = debug_render_every > 0
-    debug_cameras: List[Camera] = []
-    if debug_active:
-        # Clear existing debug images
+    log = {"loss": [], "lang": []}
+    cached_debug_cams: List[Camera] = []
+    if debug_render_every > 0:
         if os.path.exists(debug_render_dir):
             import shutil
+
             shutil.rmtree(debug_render_dir)
         os.makedirs(debug_render_dir, exist_ok=True)
-        if debug_num_perspectives > 0:
-            debug_cameras = [
-                sample_random_perspective(grid_inr)
-                for _ in range(debug_num_perspectives)
-            ]
+        cached_debug_cams = [
+            sample_random_perspective(grid_inr) for _ in range(max(0, debug_num_perspectives))
+        ]
 
-    pbar = tqdm(range(1, steps + 1), desc="Stage2 Training")
-    for step in pbar:
-        semantic_layer.train()
+    # Pre-compute SAM hierarchies for a cache of views to avoid recomputing every iteration
+    import pickle
+    cache_dir = "results/stage2"
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"sam_cache_{cache_size}views.pkl")
 
-        # Render one view per iteration (faster)
-        cam = sample_random_perspective(grid_inr)
+    if os.path.exists(cache_file):
+        print(f"\n[Stage2] Loading SAM cache from {cache_file}...")
+        try:
+            with open(cache_file, 'rb') as f:
+                sam_cache = pickle.load(f)
+            print(f"[Stage2] Loaded SAM cache with {len(sam_cache)} entries.")
+        except Exception as e:
+            print(f"[Stage2] Failed to load cache: {e}. Building new cache...")
+            sam_cache = None
+    else:
+        sam_cache = None
 
-        # Render view
-        img, aux = differentiable_render_from_inr(
-            grid_inr=grid_inr,
-            camera=cam,
-            image_hw=image_hw,
-            n_samples=n_samples,
-            transfer_function=transfer_function,
-        )
+    if sam_cache is None:
+        print(f"\n[Stage2] Pre-computing SAM hierarchies for {cache_size} views...")
+        sam_cache: List[Dict[str, Any]] = []
+        for cache_idx in tqdm(range(cache_size), desc="Building SAM cache"):
+            camera = sample_random_perspective(grid_inr)
+            img, aux = render_fn(camera)
+            img = img.clamp(0, 1)
+            targets = sam_hierarchy_maps(img, sam_generator, clipseg_model)
+            sam_cache.append({
+                "camera": camera,
+                "img": img.detach().cpu(),  # Move to CPU for serialization
+                "aux": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in aux.items()},
+                "targets": {k: v.detach().cpu() for k, v in targets.items()},
+            })
+        print(f"[Stage2] SAM cache built with {len(sam_cache)} entries.")
 
-        # Extract CLIP visual embedding (512-dim CLS token, text-aligned!)
-        clip_feat = clipseg_image_encoder(clipseg_model, img, out_size=352)
-        clip_feat = F.normalize(clip_feat, dim=-1)  # [512]
+        # Save cache to disk
+        print(f"[Stage2] Saving SAM cache to {cache_file}...")
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(sam_cache, f)
+            print(f"[Stage2] SAM cache saved successfully.")
+        except Exception as e:
+            print(f"[Stage2] Failed to save cache: {e}")
 
-        # Process view
-        hit_idx = aux["hit_idx"]
-        weights = aux["weights"]
-        coords_norm = aux["coords_norm"]
-        v_norm = aux["v_norm"]
-        N_valid = hit_idx.numel()
+    # Keep cache on CPU to save GPU memory - will move to GPU on demand during training
+    print(f"[Stage2] Cache stored on CPU. Entries will be moved to GPU on-demand during training.")
 
-        if N_valid == 0:
+    def _collect_ray_latents(aux: Dict[str, Any]) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        hit_idx: torch.Tensor = aux["hit_idx"]
+        if hit_idx.numel() == 0:
+            return None
+
+        coords: torch.Tensor = aux["coords_norm"]
+        weights: torch.Tensor = aux["weights"]
+        values: torch.Tensor = aux["v_norm"]
+        chunk = ray_chunk_size if ray_chunk_size and ray_chunk_size > 0 else hit_idx.numel()
+        latent_dim = semantic_layer.d
+        dtype = coords.dtype
+        device_ = coords.device
+
+        acc_s = torch.empty((hit_idx.numel(), latent_dim), device=device_, dtype=dtype)
+        acc_p = torch.empty_like(acc_s)
+        acc_w = torch.empty_like(acc_s)
+
+        for start in range(0, hit_idx.numel(), chunk):
+            end = min(start + chunk, hit_idx.numel())
+            zs, zp, zw = semantic_layer.forward_per_pixel(
+                coords[start:end], values[start:end], weights[start:end]
+            )
+            acc_s[start:end] = zs
+            acc_p[start:end] = zp
+            acc_w[start:end] = zw
+
+        image_hw = aux["image_hw"]
+        Fs = map_ray_features_to_image(acc_s, hit_idx, image_hw)
+        Fp = map_ray_features_to_image(acc_p, hit_idx, image_hw)
+        Fw = map_ray_features_to_image(acc_w, hit_idx, image_hw)
+        return Fs, Fp, Fw
+
+    def _sync():
+        if amp_enabled:
+            torch.cuda.synchronize(device)
+
+    stats_buffer: Dict[str, List[Any]] = {
+        "s_cov": [], "p_cov": [], "w_cov": [],
+        "s_hit_cov": [], "p_hit_cov": [], "w_hit_cov": [],
+        "s_hit_pix": [], "p_hit_pix": [], "w_hit_pix": [],
+        "s_pred_norm": [], "p_pred_norm": [], "w_pred_norm": [],
+        "s_tgt_norm": [], "p_tgt_norm": [], "w_tgt_norm": [],
+    }
+
+    def _append_stat(key: str, value: Any) -> None:
+        stats_buffer[key].append(value)
+
+    def _recent_mean(key: str, window: int) -> Optional[float]:
+        values = stats_buffer.get(key, [])
+        if not values:
+            return None
+        window = min(window, len(values))
+        recent = values[-window:]
+        numeric = [v for v in recent if v is not None]
+        if not numeric:
+            return None
+        return float(sum(numeric) / len(numeric))
+
+    def _recent_int_mean(key: str, window: int) -> Optional[float]:
+        values = stats_buffer.get(key, [])
+        if not values:
+            return None
+        window = min(window, len(values))
+        recent = values[-window:]
+        numeric = [float(v) for v in recent if v is not None]
+        if not numeric:
+            return None
+        return float(sum(numeric) / len(numeric))
+
+    for step in range(1, steps + 1):
+        # Sample from pre-computed SAM cache and move to GPU
+        cache_idx = random.randint(0, len(sam_cache) - 1)
+        cached = sam_cache[cache_idx]
+        img = cached["img"].to(device)
+        aux = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in cached["aux"].items()}
+        targets = {k: v.to(device) for k, v in cached["targets"].items()}
+
+        H, W, _ = targets["s"].shape
+        hit_idx: torch.Tensor = aux["hit_idx"]
+        if hit_idx.numel() == 0:
             continue
+        hit_map = torch.zeros(H * W, device=device, dtype=torch.bool)
+        hit_map[hit_idx] = True
+        hit_map = hit_map.view(H, W)
 
-        # Predict per-ray features
-        sem_features = []
-        for start in range(0, N_valid, ray_chunk_size):
-            end = min(start + ray_chunk_size, N_valid)
-            feats_chunk = semantic_layer.forward_per_pixel(
-                coords_norm[start:end],
-                v_norm[start:end],
-                weights[start:end]
-            )
-            sem_features.append(feats_chunk)
-        sem_features = torch.cat(sem_features, dim=0)  # [N_valid, 512]
-        sem_features = F.normalize(sem_features, dim=-1)
+        # Semantic layer update
+        ray_latents = _collect_ray_latents(aux)
+        if ray_latents is None:
+            continue
+        Fs, Fp, Fw = ray_latents
+        encoded_targets = {k: v for k, v in targets.items()}
+        mask_raw = {
+            "s": (targets["s"].abs().sum(-1) > 0),
+            "p": (targets["p"].abs().sum(-1) > 0),
+            "w": (targets["w"].abs().sum(-1) > 0),
+        }
+        mask_bool = {k: mask_raw[k] & hit_map for k in mask_raw.keys()}
+        mask_counts = {k: int(v.sum().item()) for k, v in mask_bool.items()}
+        mask_tensors = {
+            "s": mask_bool["s"].unsqueeze(-1).to(dtype=Fs.dtype),
+            "p": mask_bool["p"].unsqueeze(-1).to(dtype=Fp.dtype),
+            "w": mask_bool["w"].unsqueeze(-1).to(dtype=Fw.dtype),
+        }
+        min_valid_pixels = 256
 
-        # Aggregate semantic features across all rays to get global image embedding
-        # Weight by volumetric contribution for better representation
-        ray_weights = weights.sum(dim=1, keepdim=True)  # [N_valid, 1]
-        ray_weights = ray_weights / (ray_weights.sum() + 1e-8)
-        pred_feat = (sem_features * ray_weights).sum(dim=0)  # [512]
-        pred_feat = F.normalize(pred_feat, dim=-1)
+        optimizer_sem.zero_grad(set_to_none=True)
+        lang_loss = None
+        with autocast(enabled=amp_enabled):
+            loss_terms = []
+            if mask_counts["s"] >= min_valid_pixels:
+                loss_terms.append(_lat_loss_masked(Fs, encoded_targets["s"], mask_tensors["s"]))
+            if mask_counts["p"] >= min_valid_pixels:
+                loss_terms.append(_lat_loss_masked(Fp, encoded_targets["p"], mask_tensors["p"]))
+            if mask_counts["w"] >= min_valid_pixels:
+                loss_terms.append(_lat_loss_masked(Fw, encoded_targets["w"], mask_tensors["w"]))
+            if loss_terms:
+                lang_loss = torch.stack(loss_terms).sum()
+        if lang_loss is None:
+            continue
+        lang_loss_value = float(lang_loss.detach())
+        scaler_sem.scale(lang_loss).backward()
+        scaler_sem.unscale_(optimizer_sem)
+        torch.nn.utils.clip_grad_norm_(semantic_layer.parameters(), 1.0)
+        scaler_sem.step(optimizer_sem)
+        scaler_sem.update()
+        _sync()
 
-        # Cosine similarity loss: encourage predicted features to match CLIP embedding
-        feature_loss = 1.0 - F.cosine_similarity(pred_feat.unsqueeze(0), clip_feat.unsqueeze(0), dim=1).mean()
+        for key, pred, target in (
+            ("s", Fs, encoded_targets["s"]),
+            ("p", Fp, encoded_targets["p"]),
+            ("w", Fw, encoded_targets["w"]),
+        ):
+            raw_mask = mask_raw[key]
+            hit_mask = mask_bool[key]
+            coverage = raw_mask.float().mean().item()
+            hit_coverage = hit_mask.float().mean().item()
+            hit_pixels = int(hit_mask.sum().item())
 
-        loss = feature_loss
+            _append_stat(f"{key}_cov", coverage)
+            _append_stat(f"{key}_hit_cov", hit_coverage)
+            _append_stat(f"{key}_hit_pix", hit_pixels)
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+            if hit_pixels > 0:
+                pred_norm = pred[hit_mask].norm(dim=-1).mean().item()
+                tgt_norm = target[hit_mask].norm(dim=-1).mean().item()
+            else:
+                pred_norm = None
+                tgt_norm = None
 
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(semantic_layer.parameters(), max_norm=1.0)
+            _append_stat(f"{key}_pred_norm", pred_norm)
+            _append_stat(f"{key}_tgt_norm", tgt_norm)
 
-        optimizer.step()
+        total_loss_value = lang_loss_value
+        log["loss"].append(total_loss_value)
+        log["lang"].append(lang_loss_value)
 
-        if scheduler is not None:
-            scheduler.step()
-
-        loss_item = float(loss.item())
-        feat_loss_item = float(feature_loss.item())
-
-        log["loss"].append(loss_item)
-        log["feature_loss"].append(feat_loss_item)
-
-        # Update progress bar with loss info
-        current_lr = optimizer.param_groups[0]['lr']
-        pbar.set_postfix({
-            'loss': f'{loss_item:.4f}',
-            'feat': f'{feat_loss_item:.4f}',
-            'lr': f'{current_lr:.2e}'
-        })
-
+        # Log to Neptune
+        if neptune_run is not None:
+            neptune_run["train/loss"].append(total_loss_value)
+            neptune_run["train/lang_loss"].append(lang_loss_value)
         if print_every and (step % print_every == 0 or step == 1):
-            # Compute diagnostic stats
-            with torch.no_grad():
-                global_sim = float(F.cosine_similarity(pred_feat.unsqueeze(0), clip_feat.unsqueeze(0), dim=1))
+            window = print_every if print_every > 0 else 1
+            def _fmt(val: Optional[float], precision: int = 4) -> str:
+                if val is None:
+                    return "n/a"
+                return f"{val:.{precision}f}"
 
-            tqdm.write(
-                f"[Stage2] step {step:5d}/{steps}"
-                f"  loss={loss_item:.4f}"
-                f"  (feat={feat_loss_item:.4f})"
-                f"  lr={current_lr:.2e}"
-                f"  similarity={global_sim:.4f}"
+            print(
+                f"[Stage2] step {step:5d}/{steps} "
+                f"loss={total_loss_value:.4f} lang={lang_loss_value:.4f}"
+            )
+            cov_s = _fmt(_recent_mean("s_cov", window))
+            cov_p = _fmt(_recent_mean("p_cov", window))
+            cov_w = _fmt(_recent_mean("w_cov", window))
+            hit_cov_s = _fmt(_recent_mean("s_hit_cov", window))
+            hit_cov_p = _fmt(_recent_mean("p_hit_cov", window))
+            hit_cov_w = _fmt(_recent_mean("w_hit_cov", window))
+            hit_pix_s = _fmt(_recent_int_mean("s_hit_pix", window), precision=1)
+            hit_pix_p = _fmt(_recent_int_mean("p_hit_pix", window), precision=1)
+            hit_pix_w = _fmt(_recent_int_mean("w_hit_pix", window), precision=1)
+            pred_norm_s = _fmt(_recent_mean("s_pred_norm", window))
+            pred_norm_p = _fmt(_recent_mean("p_pred_norm", window))
+            pred_norm_w = _fmt(_recent_mean("w_pred_norm", window))
+            tgt_norm_s = _fmt(_recent_mean("s_tgt_norm", window))
+            tgt_norm_p = _fmt(_recent_mean("p_tgt_norm", window))
+            tgt_norm_w = _fmt(_recent_mean("w_tgt_norm", window))
+            print(
+                "         mask_cov s/p/w="
+                f"{cov_s}/{cov_p}/{cov_w} | hit_cov s/p/w={hit_cov_s}/{hit_cov_p}/{hit_cov_w} "
+                f"| hit_px s/p/w={hit_pix_s}/{hit_pix_p}/{hit_pix_w}"
+            )
+            print(
+                "         latent_norm pred s/p/w="
+                f"{pred_norm_s}/{pred_norm_p}/{pred_norm_w} | tgt s/p/w="
+                f"{tgt_norm_s}/{tgt_norm_p}/{tgt_norm_w}"
             )
 
-        if debug_active and (step == 1 or step % debug_render_every == 0):
-            semantic_layer.eval()
-            debug_images: List[Tuple[str, torch.Tensor]] = []
-
-            # Save current training view
-            debug_images.append(("train", img))
-
-            # Save fixed debug viewpoints
-            for idx, dbg_cam in enumerate(debug_cameras):
+        if debug_render_every and (step == 1 or step % debug_render_every == 0):
+            debug_images = [("train", img)]
+            for idx, cam in enumerate(cached_debug_cams):
                 with torch.no_grad():
-                    dbg_img, _ = render_fn(dbg_cam)
-                debug_images.append((f"view{idx}", dbg_img))
-
-            for tag, dbg_tensor in debug_images:
-                img_cpu = dbg_tensor.detach().clamp(0.0, 1.0).cpu()
-                img_np = img_cpu.numpy()
-                img_uint8 = np.ascontiguousarray(
-                    np.clip(np.rint(img_np * 255.0), 0, 255).astype(np.uint8)
-                )
-                filename = os.path.join(debug_render_dir, f"step{step:06d}_{tag}.png")
-                imageio.imwrite(filename, img_uint8)
+                    debug_img, _ = render_fn(cam)
+                debug_images.append((f"view{idx}", debug_img))
+            for tag, tensor in debug_images:
+                array = (tensor.detach().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+                imageio.imwrite(os.path.join(debug_render_dir, f"step{step:06d}_{tag}.png"), array)
 
     return log
+
+# ---------- Relevancy (viewer) ----------
+@torch.no_grad()
+def relevancy_score(img_feat: torch.Tensor, txt: torch.Tensor, canonical: List[torch.Tensor]) -> torch.Tensor:
+    txt = F.normalize(txt, dim=-1); can = [F.normalize(c, dim=-1) for c in canonical]
+    s = torch.exp((img_feat*txt).sum(-1))
+    scores = []
+    for c in can:
+        sc = s/(s + torch.exp((img_feat*c).sum(-1)))
+        scores.append(sc)
+    return torch.stack(scores, -1).min(-1).values
