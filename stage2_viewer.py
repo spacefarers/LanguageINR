@@ -56,7 +56,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 import torch
@@ -114,7 +114,7 @@ class VolumeSemanticSearcher:
         transfer_fn_path: str = TRANSFER_FUNCTION_DEFAULT,
         default_res_hw: Tuple[int, int] = (512, 512),
         default_samples: int = 16,
-        voxel_batch_cap: int = 512 * 512,  # process ~1M voxels per chunk by default
+        voxel_batch_cap: int = 256 * 256,  # cap per-chunk voxels to a single depth slice by default
     ) -> None:
         self.image_hw = list(default_res_hw)
         self.n_samples = int(default_samples)
@@ -140,9 +140,12 @@ class VolumeSemanticSearcher:
         _ensure(os.path.exists(stage2_head_path), f"Missing Stage‑2 head at {stage2_head_path}")
         head_state = torch.load(stage2_head_path, map_location="cpu")
         def _infer_latent_dim(state_dict: Dict[str, torch.Tensor]) -> int:
-            dims = [tensor.shape[0] for key, tensor in state_dict.items() if key.startswith("head_s.") and key.endswith("weight")]
-            _ensure(len(dims) > 0, "Unable to infer latent dimension from Stage-2 head state dict")
-            return int(min(dims))
+            # Try to find head weights (head_s, head_p, or head_w)
+            for head_key in ["head_s.weight", "head_p.weight", "head_w.weight"]:
+                if head_key in state_dict:
+                    # Output dimension is the first dimension of the weight matrix
+                    return int(state_dict[head_key].shape[0])
+            _ensure(False, "Unable to infer latent dimension from Stage-2 head state dict")
         self.latent_dim = _infer_latent_dim(head_state)
         self.semantic = stage2.LangSemanticLayer(hidden_dim=256, n_hidden=3, d=self.latent_dim).to(device)
         self.semantic.load_state_dict(head_state)
@@ -159,6 +162,10 @@ class VolumeSemanticSearcher:
         self._S: Optional[torch.Tensor] = None           # [D,H,W] float
         self._argmax_norm: Optional[torch.Tensor] = None # [3] in [-1,1] (x,y,z)
         self._v_norm: Optional[torch.Tensor] = None      # [D,H,W,1] float
+        self._S_levels: Dict[str, torch.Tensor] = {}
+        self.hierarchy_mode: str = "auto"
+        self.use_canonical_negatives: bool = True
+        self._selected_level: Optional[str] = None
 
     def _ensure_scalar_field(self) -> torch.Tensor:
         """Cache the normalized scalar volume so downstream passes avoid re-sampling the INR."""
@@ -202,18 +209,30 @@ class VolumeSemanticSearcher:
     # --------- Similarity grid ---------
 
     @torch.no_grad()
-    def build_similarity_grid(self, z_text: torch.Tensor, aggregation_radius: int = 3) -> None:
-        """
-        Builds S in depth chunks to bound memory.
-        z_text: [512] normalized.
-        """
+    def build_similarity_grid(
+        self,
+        z_text: torch.Tensor,
+        aggregation_radius: int = 3,
+        *,
+        hierarchy_mode: Optional[str] = None,
+        use_canonical: Optional[bool] = None,
+    ) -> None:
+        """Build similarity grids for each hierarchy level and cache the selection."""
         Dv, Hv, Wv = self._Dv, self._Hv, self._Wv
+        mode = (hierarchy_mode or self.hierarchy_mode or "auto").lower()
+        use_canon = self.use_canonical_negatives if use_canonical is None else use_canonical
 
-        # Keep text embedding on device; half precision is fine for dot-product
-        z_text = _normalize(z_text).to(device=device, dtype=torch.float16)
-        # canonical negatives for LERF-style relevancy
-        canon_phrases = ["object", "things", "stuff", "texture"]
-        canon = [self.encode_text(p).to(torch.float16) for p in canon_phrases]
+        # Reset cached similarity to release memory from previous queries.
+        self._S = None
+        self._S_levels = {}
+        self._selected_level = None
+
+        # Normalize query embedding
+        z_text = _normalize(z_text).to(device=device, dtype=torch.float32)
+        canon = []
+        if use_canon:
+            canon_phrases = ["object", "things", "stuff", "texture"]
+            canon = [self.encode_text(p).to(device=device, dtype=torch.float32) for p in canon_phrases]
 
         x_coords = torch.linspace(-1, 1, Wv, device=device, dtype=torch.float32)
         y_coords = torch.linspace(-1, 1, Hv, device=device, dtype=torch.float32)
@@ -221,86 +240,134 @@ class VolumeSemanticSearcher:
 
         v_norm_full = self._ensure_scalar_field()  # [D,H,W,1]
 
-        # How many z-slices per chunk?
         voxels_per_slice = Hv * Wv
         max_voxels = max(voxels_per_slice, self.voxel_batch_cap)
         z_per_chunk = max(1, max_voxels // voxels_per_slice)
 
-        # Account for local aggregation padding
         pad = max(0, int(aggregation_radius))
         kernel = 2 * pad + 1
 
-        S = torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32)
+        S_levels = {
+            "s": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
+            "p": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
+            "w": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
+        }
 
-        # Prebuild base (y,x) grid to avoid re‑allocations
         yy_base, xx_base = torch.meshgrid(y_coords, x_coords, indexing="ij")
-        yy_base = yy_base.unsqueeze(0)  # [1,H,W]
-        xx_base = xx_base.unsqueeze(0)  # [1,H,W]
+        yy_base = yy_base.unsqueeze(0)
+        xx_base = xx_base.unsqueeze(0)
+
+        d_feat = self.latent_dim
 
         for start in range(0, Dv, z_per_chunk):
             end = min(start + z_per_chunk, Dv)
+            depth = end - start
 
-            # Expand chunk with padding for local aggregation
-            c0 = max(0, start - pad)
-            c1 = min(Dv, end + pad)
-            depth = c1 - c0
+            z_chunk = z_coords[start:end].view(-1, 1, 1).expand(-1, Hv, Wv)
+            yy = yy_base.expand(depth, -1, -1)
+            xx = xx_base.expand(depth, -1, -1)
+            coords = torch.stack([xx, yy, z_chunk], dim=-1).reshape(-1, 3)
+            v_chunk = v_norm_full[start:end].reshape(-1, 1)
+            inputs = torch.cat([coords, v_chunk], dim=-1)
 
-            z_chunk = z_coords[c0:c1].view(-1, 1, 1).expand(-1, Hv, Wv)  # [depth,H,W]
-            yy = yy_base.expand(depth, -1, -1)                     # [depth,H,W]
-            xx = xx_base.expand(depth, -1, -1)                     # [depth,H,W]
-            coords = torch.stack([xx, yy, z_chunk], dim=-1).reshape(-1, 3)  # [N,3]
+            def _rel(x: torch.Tensor) -> torch.Tensor:
+                flat = x.view(-1, d_feat)
+                if use_canon:
+                    return stage2.relevancy_score(flat, z_text, canon).view(-1, Hv, Wv)
+                scores = flat @ z_text.view(-1, 1)
+                return scores.view(-1, Hv, Wv)
 
-            # Per-voxel semantic features
-            v_chunk = v_norm_full[c0:c1].reshape(-1, 1)
-            zs, zp, zw = self.semantic.forward_per_sample(coords, v_chunk)  # [N,d] x3
-            ds = _normalize(zs, eps=1e-6).to(dtype=torch.float16)
-            dp = _normalize(zp, eps=1e-6).to(dtype=torch.float16)
-            dw = _normalize(zw, eps=1e-6).to(dtype=torch.float16)
-            d_feat = self.latent_dim
-            ds = ds.view(depth, Hv, Wv, d_feat)
-            dp = dp.view(depth, Hv, Wv, d_feat)
-            dw = dw.view(depth, Hv, Wv, d_feat)
+            # Pass inputs through the trunk first to get 256-D features, then project via heads
+            trunk_feats = self.semantic.trunk(inputs)  # [N, 256]
+            for key, head in (("s", self.semantic.head_s), ("p", self.semantic.head_p), ("w", self.semantic.head_w)):
+                feats = head(trunk_feats)  # [N, d_feat]
+                feats = _normalize(feats, eps=1e-6).to(dtype=torch.float32)
+                feats = feats.view(depth, Hv, Wv, d_feat)
+                S_levels[key][start:end] = _rel(feats)
+                del feats
+            del trunk_feats
 
-            # Optional local aggregation (3D average pool)
-            if pad > 0:
-                # aggregate each level
-                def _pool(vol4):
-                    vol = vol4.permute(3, 0, 1, 2).unsqueeze(0)  # [1,512,depth,H,W]
-                    kD = min(kernel, depth)
-                    kH = min(kernel, Hv)
-                    kW = min(kernel, Wv)
-                    pD = (kD - 1) // 2
-                    pH = (kH - 1) // 2
-                    pW = (kW - 1) // 2
-                    vol = F.avg_pool3d(vol, kernel_size=(kD, kH, kW), stride=1, padding=(pD, pH, pW))
-                    return _normalize(vol.squeeze(0).permute(1, 2, 3, 0), eps=1e-6)
-                ds, dp, dw = _pool(ds), _pool(dp), _pool(dw)
+            del coords, v_chunk, inputs, z_chunk, yy, xx
 
-            # Strip padded rows to keep only [start:end]
-            s_off = start - c0
-            e_off = s_off + (end - start)
-            ds = ds[s_off:e_off]
-            dp = dp[s_off:e_off]
-            dw = dw[s_off:e_off]
-            # relevancy with canonical negatives; take best hierarchy level
-            def _rel(x):  # x:[dz,H,W,d]
-                x = x.view(-1, d_feat)
-                return stage2.relevancy_score(x, z_text, canon).view(-1, Hv, Wv)
-            r_s, r_p, r_w = _rel(ds), _rel(dp), _rel(dw)
-            S[start:end] = torch.maximum(r_w, torch.maximum(r_s, r_p))
+        if pad > 0:
+            weight = torch.ones((1, 1, kernel, kernel, kernel), device=device, dtype=torch.float32)
+            ones_volume = torch.ones((1, 1, Dv, Hv, Wv), device=device, dtype=torch.float32)
+            norm = F.conv3d(ones_volume, weight, padding=pad)
+            norm = norm.clamp_min(1.0)
+            for key in S_levels.keys():
+                vol = S_levels[key].unsqueeze(0).unsqueeze(0)
+                smoothed = F.conv3d(vol, weight, padding=pad) / norm
+                S_levels[key] = smoothed.squeeze(0).squeeze(0).contiguous()
+            del weight, ones_volume, norm
 
-            # free chunk locals
-            del coords, v_chunk, ds, dp, dw, z_chunk, yy, xx
+        self._S_levels = {k: v.contiguous() for k, v in S_levels.items()}
+        self.hierarchy_mode = mode
+        self.use_canonical_negatives = use_canon
+        self._S, selected = self._resolve_hierarchy_map(mode)
+        self._selected_level = selected
 
-        # Cache
-        self._S = S.contiguous()
-
-        # Argmax in normalized coordinates
-        flat_idx = int(torch.argmax(S).item())
+        flat_idx = int(torch.argmax(self._S).item())
         d = flat_idx // (Hv * Wv)
         h = (flat_idx % (Hv * Wv)) // Wv
         w = flat_idx % Wv
-        self._argmax_norm = torch.stack([x_coords[w], y_coords[h], z_coords[d]])  # (x,y,z) in [-1,1]
+        self._argmax_norm = torch.stack([x_coords[w], y_coords[h], z_coords[d]])
+
+    def _resolve_hierarchy_map(self, mode: str) -> Tuple[torch.Tensor, str]:
+        if not self._S_levels:
+            raise RuntimeError("Similarity grid has not been built yet.")
+        mode_l = (mode or "auto").lower()
+        mapping = {
+            "subpart": "s",
+            "s": "s",
+            "part": "p",
+            "p": "p",
+            "whole": "w",
+            "w": "w",
+        }
+        if mode_l in mapping:
+            key = mapping[mode_l]
+            return self._S_levels[key], key
+        if mode_l == "max":
+            combined = torch.maximum(
+                torch.maximum(self._S_levels["s"], self._S_levels["p"]),
+                self._S_levels["w"],
+            )
+            return combined.contiguous(), "max"
+        if mode_l == "sum":
+            combined = (self._S_levels["s"] + self._S_levels["p"] + self._S_levels["w"]) / 3.0
+            return combined.contiguous(), "sum"
+        if mode_l == "auto":
+            scores = {}
+            for key, volume in self._S_levels.items():
+                flat = volume.view(-1)
+                if flat.numel() == 0:
+                    scores[key] = float("-inf")
+                else:
+                    topk = max(1, int(flat.numel() * 0.01))
+                    scores[key] = float(torch.topk(flat, topk).values.mean().item())
+            best_key = max(scores.keys(), key=lambda k: scores[k])
+            return self._S_levels[best_key], best_key
+        raise ValueError(f"Unknown hierarchy mode '{mode}'.")
+
+    def set_hierarchy_mode(self, mode: str) -> None:
+        self.hierarchy_mode = mode
+        if self._S_levels:
+            self._S, selected = self._resolve_hierarchy_map(mode)
+            self._selected_level = selected
+
+    def save_similarity_volume(self, path: str, level: Optional[str] = None) -> None:
+        if not self._S_levels and self._S is None:
+            raise RuntimeError("Similarity grid not computed; call build_similarity_grid first.")
+        if level is None:
+            sim = self._S
+        else:
+            sim, _ = self._resolve_hierarchy_map(level)
+        np.savez_compressed(path, similarity=sim.detach().cpu().numpy())
+
+    def get_similarity_levels(self) -> Dict[str, torch.Tensor]:
+        if not self._S_levels:
+            raise RuntimeError("Similarity grid not computed; call build_similarity_grid first.")
+        return {k: v.detach().cpu() for k, v in self._S_levels.items()}
 
     # --------- Rendering ---------
 
@@ -740,6 +807,11 @@ def main(argv=None) -> int:
     p.add_argument("--phrase", type=str, default="", help="Text phrase to search for (CLI mode)")
     p.add_argument("--save", type=str, default="viewer_out.png", help="Path to save rendered image (CLI mode)")
     p.add_argument("--cli", action="store_true", help="Force CLI mode (skip GUI)")
+    p.add_argument("--hierarchy", type=str, default="auto", choices=["auto", "max", "subpart", "part", "whole", "sum"], help="Hierarchy mode for similarity selection")
+    p.add_argument("--no-canon", action="store_true", help="Disable canonical negatives and use raw cosine scores")
+    p.add_argument("--save-sim", type=str, default=None, help="Optional path to save the similarity volume (.npz)")
+    p.add_argument("--save-sim-level", type=str, default="selected", choices=["selected", "subpart", "part", "whole", "max", "sum"], help="Hierarchy level to save when using --save-sim")
+    p.add_argument("--print-level-stats", action="store_true", help="Print per-level summary statistics after building the similarity grid")
     args = p.parse_args(argv)
 
     searcher = VolumeSemanticSearcher(
@@ -749,6 +821,8 @@ def main(argv=None) -> int:
         transfer_fn_path=args.tf,
         default_res_hw=(args.res, args.res),
     )
+    searcher.use_canonical_negatives = not args.no_canon
+    searcher.set_hierarchy_mode(args.hierarchy)
 
     # Try GUI by default unless --cli is specified
     if not args.cli:
@@ -764,7 +838,28 @@ def main(argv=None) -> int:
 
     if args.phrase:
         z_text = searcher.encode_text(args.phrase)
-        searcher.build_similarity_grid(z_text, aggregation_radius=args.agg)
+        searcher.build_similarity_grid(
+            z_text,
+            aggregation_radius=args.agg,
+            hierarchy_mode=args.hierarchy,
+            use_canonical=not args.no_canon,
+        )
+        selected = searcher._selected_level or args.hierarchy
+        print(f"[viewer] Selected hierarchy: {selected}")
+        if args.print_level_stats:
+            levels = searcher.get_similarity_levels()
+            for key, vol in levels.items():
+                flat = vol.view(-1)
+                mean = float(flat.mean().item())
+                q95 = float(torch.quantile(flat, 0.95).item()) if flat.numel() > 0 else float('nan')
+                mx = float(flat.max().item()) if flat.numel() > 0 else float('nan')
+                label = {"s": "subpart", "p": "part", "w": "whole"}.get(key, key)
+                print(f"  [{label}] mean={mean:.4f} q95={q95:.4f} max={mx:.4f}")
+        if args.save_sim:
+            level_to_save = None if args.save_sim_level == "selected" else args.save_sim_level
+            os.makedirs(os.path.dirname(args.save_sim) or ".", exist_ok=True)
+            searcher.save_similarity_volume(args.save_sim, level=level_to_save)
+            print(f"[viewer] Saved similarity volume to {args.save_sim}")
         img = searcher.render_highlight(cam, threshold=args.threshold, blob_radius_vox=args.blob, image_hw=(args.res, args.res))
     else:
         img = searcher.render_base(cam, image_hw=(args.res, args.res))

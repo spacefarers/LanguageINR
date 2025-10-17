@@ -1,0 +1,72 @@
+/home/spacefarers/miniconda3/envs/ml/lib/python3.11/site-packages/open_clip/factory.py:450: UserWarning: QuickGELU mismatch between final model config (quick_gelu=False) and pretrained tag 'openai' (quick_gelu=True).
+  warnings.warn(
+W1016 22:50:04.391000 109614 site-packages/torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1016 22:50:04.391000 109614 site-packages/torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+Traceback (most recent call last):
+  File "/mnt/d/code/LanguageINR/main.py", line 177, in <module>
+    fire.Fire(main)
+  File "/home/spacefarers/miniconda3/envs/ml/lib/python3.11/site-packages/fire/core.py", line 135, in Fire
+    component_trace = _Fire(component, args, parsed_flag_args, context, name)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/spacefarers/miniconda3/envs/ml/lib/python3.11/site-packages/fire/core.py", line 468, in _Fire
+    component, remaining_args = _CallAndUpdateTrace(
+                                ^^^^^^^^^^^^^^^^^^^^
+  File "/home/spacefarers/miniconda3/envs/ml/lib/python3.11/site-packages/fire/core.py", line 684, in _CallAndUpdateTrace
+    component = fn(*varargs, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/code/LanguageINR/main.py", line 116, in main
+    history = stage2.train_semantic_layer(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/code/LanguageINR/stage2.py", line 464, in train_semantic_layer
+    render_feat_s, render_feat_p, render_feat_w = render_semantics(
+                                                  ^^^^^^^^^^^^^^^^^
+  File "/mnt/d/code/LanguageINR/stage2.py", line 648, in render_semantics
+    feat_s_img = render.render_with_nerfacc(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/code/LanguageINR/render.py", line 303, in render_with_nerfacc
+    features, sigmas = batch_rgb_sigma_fn(batch_t_starts, batch_t_ends, batch_ray_indices)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/code/LanguageINR/render.py", line 287, in batch_rgb_sigma_fn
+    return rgb_sigma_from_vol(t_starts, t_ends, global_ray_indices, origins, dirs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/code/LanguageINR/render.py", line 239, in rgb_sigma_from_vol
+    features, sigmas = feature_fn(pts)
+                       ^^^^^^^^^^^^^^^
+  File "/mnt/d/code/LanguageINR/stage2.py", line 619, in feature_fn
+    values = torch.cat(values_list, dim=0) if len(values_list) > 1 else values_list[0]
+                                                                        ~~~~~~~~~~~^^^
+IndexError: list index out of range
+
+ERROR conda.cli.main_run:execute(127): `conda run python main.py --mode=stage2` failed. (See above for error)
+Starting Stage 2 Training (SAM2 + CLIP semantic learning)...
+Stage 1 model frozen for Stage 2 training
+
+Configuration:
+  Steps: 500
+  Image resolution: (256, 256)
+  Network: hidden_dim=256, n_hidden=3, latent_dim=512
+  Optimizer: lr=0.0001, weight_decay=0.0001
+
+Initializing SemanticLayer...
+  Created with 527,616 parameters
+
+Building SAM2 generator...
+  SAM2 generator ready
+
+Loading CLIP model...
+  CLIP model loaded
+
+Starting training for 500 steps...
+
+  [CLIP] Processing 7 masks at level 's'...
+    Processing mask 1/7...
+    Processing mask 6/7...
+  [CLIP] Completed level 's'
+  [CLIP] Processing 2 masks at level 'p'...
+    Processing mask 1/2...
+  [CLIP] Completed level 'p'
+  [CLIP] Processing 7 masks at level 'w'...
+    Processing mask 1/7...
+    Processing mask 6/7...
+  [CLIP] Completed level 'w'
+

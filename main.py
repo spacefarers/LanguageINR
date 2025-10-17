@@ -21,7 +21,7 @@ D, H, W = int(_z), int(_y), int(_x)
 tf_filename = TRANSFER_FUNCTION_PATH
 
 
-def main(mode="all"):
+def main(mode="stage2"):
     if mode == "stage1" or mode == "all":
         print("Starting Stage 1 Training...")
         model, vol = stage1.train_stage1_model(num_epochs=50, lr=1e-3)
@@ -36,8 +36,7 @@ def main(mode="all"):
         num_views = 10
         cameras = []
         for i in range(num_views):
-            import stage2
-            cameras.append(stage2.sample_random_perspective(model))
+            cameras.append(render.sample_random_perspective(model))
         print(f"Generated {len(cameras)} camera perspectives:\n")
         for i, cam in enumerate(cameras):
             # np.round is used for cleaner output
@@ -46,101 +45,133 @@ def main(mode="all"):
             print(f"Camera {i + 1:2d} | Azimuth: {cam.azi * 180 / np.pi:5.1f}° | Polar: {cam.polar * 180 / np.pi:5.1f}° | Position: ({pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f})")
 
     if mode == "stage2" or mode == "all":
-        print("Starting Stage 2 Training (SAM hierarchy + AE)...")
+        print("Starting Stage 2 Training (SAM2 + CLIP semantic learning)...")
         import stage2
-        import keys
-        import neptune
+        from model import SemanticLayer
 
-        # Initialize Neptune
-        run = neptune.init_run(
-            project=keys.PROJECT,
-            api_token=keys.NEPTUNE_API_TOKEN,
-            tags=["stage2", "lobster", "sam2-large", "32x32-grid"],
+        # Ensure grid_inr is frozen and in eval mode
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+        print("Stage 1 model frozen for Stage 2 training")
+
+        # Training configuration
+        num_steps = 500
+        image_hw = (256, 256)
+        hidden_dim = 256
+        n_hidden = 3
+        latent_dim = 512
+        lr = 1e-4
+        weight_decay = 1e-4
+
+        print(f"\nConfiguration:")
+        print(f"  Steps: {num_steps}")
+        print(f"  Image resolution: {image_hw}")
+        print(f"  Network: hidden_dim={hidden_dim}, n_hidden={n_hidden}, latent_dim={latent_dim}")
+        print(f"  Optimizer: lr={lr}, weight_decay={weight_decay}")
+
+        # Load transfer function
+        transfer_fn = render.ParaViewTransferFunction(tf_filename)
+
+        # Initialize semantic layer
+        print("\nInitializing SemanticLayer...")
+        semantic_layer = SemanticLayer(
+            hidden_dim=hidden_dim,
+            n_hidden=n_hidden,
+            latent_dim=latent_dim
+        ).to(device)
+        num_params = sum(p.numel() for p in semantic_layer.parameters())
+        print(f"  Created with {num_params:,} parameters")
+
+        # Create optimizer
+        optimizer = torch.optim.AdamW(
+            semantic_layer.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
         )
-        params = {
-            "stage": "stage2",
-            "dataset": "lobster",
-            "volume_dims": tuple(int(x) for x in VOLUME_DIMS),
-            "sam_model": "sam2-large",
-            "sam_points_per_side": 32,
-            "sam_points_per_batch": 64,
-            "sam_pred_iou_thresh": 0.3,
-            "sam_stability_thresh": 0.86,
-            "sam_box_nms_thresh": 0.9,
-            "clipseg_model": "ViT-B/16",
-            "hidden_dim": 256,
-            "n_hidden": 3,
-            "latent_dim": 512,
-            "lr_semantic": 5e-5,
-            "lr_ae": 5e-3,
-            "weight_decay_semantic": 1e-4,
-            "steps": 500,
-            "image_h": 160,
-            "image_w": 160,
-            "n_samples": 32,
-            "cache_size": 20,
-        }
-        run["parameters"] = {k: (v if isinstance(v, (int, float, bool, str)) else str(v)) for k, v in params.items()}
 
-        clipseg_model = stage2.load_clipseg_model("./weights/rd64-uni.pth", model_device=device)
-        transfer_fn = stage2.ParaViewTransferFunction(tf_filename)
-        latent_dim = params["latent_dim"]
-        semantic_layer = stage2.LangSemanticLayer(hidden_dim=256, n_hidden=3, d=latent_dim).to(device)
-        opt_sem = torch.optim.AdamW(semantic_layer.parameters(), lr=5e-3, weight_decay=1e-4)
-        sam_gen = stage2.build_sam_generator(
-            model_size="large",              # Using SAM 2 large for best quality
-            sam_device=device,
-            points_per_side=32,              # More points = better coverage
-            points_per_batch=64,             # Process in batches for speed
-            pred_iou_thresh=0.3,             # Loosen thresholds for volumetric renders
+        # Build SAM2 generator
+        print("\nBuilding SAM2 generator...")
+        sam_generator = stage2.build_sam2_generator(
+            model_size="large",
+            points_per_side=32,
+            points_per_batch=64,
+            pred_iou_thresh=0.3,
             stability_score_thresh=0.86,
             box_nms_thresh=0.9,
         )
+        print("  SAM2 generator ready")
 
-        train_resolution = (160, 160)
-        train_samples = 32
-        train_chunk_size = 1024  # Reduced from 2048 to save memory
+        # Load CLIP model
+        print("\nLoading CLIP model...")
+        clip_model, clip_preprocess = stage2.load_clip_model(model_name="ViT-B/32")
+        print("  CLIP model loaded")
 
-        def render_fn(cam):
-            return stage2.differentiable_render_from_inr(
-                grid_inr=model,
-                camera=cam,
-                image_hw=train_resolution,
-                n_samples=train_samples,
-                transfer_function=transfer_fn,
-            )
+        # Train semantic layer
+        print(f"\nStarting training for {num_steps} steps...\n")
 
-        log = stage2.train_with_sam_hierarchy(
-            render_fn=render_fn,
+        # Use smaller batch size to avoid CUDA errors
+        batch_size = 2048  # Reduced from default 8192 to avoid CUDA kernel issues
+
+        history = stage2.train_semantic_layer(
             grid_inr=model,
             semantic_layer=semantic_layer,
-            clipseg_model=clipseg_model,
-            optimizer_sem=opt_sem,
-            sam_generator=sam_gen,
-            steps=500,
-            image_hw=train_resolution,
-            n_samples=train_samples,
-            print_every=25,
-            ray_chunk_size=train_chunk_size,
-            debug_render_every=50,
-            debug_render_dir="results/stage2/debug_views",
-            debug_num_perspectives=3,
+            optimizer=optimizer,
+            sam_generator=sam_generator,
+            clip_model=clip_model,
+            clip_preprocess=clip_preprocess,
             transfer_function=transfer_fn,
-            neptune_run=run,
-            cache_size=20,  # Pre-compute SAM for 20 views to eliminate bottleneck
+            num_steps=num_steps,
+            image_hw=image_hw,
+            print_every=25,
+            loss_type="cosine",
+            batch_size=batch_size,
         )
 
+        # Save semantic layer
         os.makedirs("./models", exist_ok=True)
-        torch.save(semantic_layer.state_dict(), "./models/stage2_semantic_head.pth")
+        model_path = "./models/stage2_semantic_head.pth"
+        torch.save(semantic_layer.state_dict(), model_path)
+        print(f"\nSaved trained semantic layer to {model_path}")
 
         # Print training summary
         print("\nStage 2 Training Completed.")
-        print(f"Final loss: {log['loss'][-1]:.4f}  (lang={log['lang'][-1]:.4f})")
-        print(f"Min total loss: {min(log['loss']):.4f}")
+        print(f"  Final loss: {history['loss'][-1]:.4f}")
+        print(f"  Min loss: {min(history['loss']):.4f}")
+        print(f"  Final hierarchical losses: s={history['loss_s'][-1]:.4f}, p={history['loss_p'][-1]:.4f}, w={history['loss_w'][-1]:.4f}")
 
-        # Stop Neptune run
-        run.stop()
-        print("Neptune logging stopped.")
+    if mode == "infer" or mode == "all":
+        print("\nRunning Stage 2 inference renders...")
+        inference_phrases = ["pot", "container", "planter", "soil", "ground", "foliage", "leaves"]
+        try:
+            from stage2_viewer import VolumeSemanticSearcher, _default_orbit, _build_camera
+            import imageio
+
+            searcher = VolumeSemanticSearcher(
+                stage1_path="./models/stage1_ngp_tcnn.pth",
+                stage2_head_path="./models/stage2_semantic_head.pth",
+            )
+            orbit = _default_orbit(searcher)
+            cam = _build_camera(orbit)
+            os.makedirs("results", exist_ok=True)
+
+            for phrase in inference_phrases:
+                print(f"  - Rendering phrase '{phrase}'")
+                z_text = searcher.encode_text(phrase)
+                searcher.build_similarity_grid(
+                    z_text,
+                    aggregation_radius=3,
+                    hierarchy_mode="auto",
+                    use_canonical=True,
+                )
+                img = searcher.render_highlight(cam, threshold=0.6, blob_radius_vox=0.0)
+                safe_name = phrase.lower().replace(" ", "_")
+                out_path = os.path.join("results", f"stage2_{safe_name}.png")
+                imageio.imwrite(out_path, img)
+                print(f"    Saved {out_path}")
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"[warning] Stage 2 inference failed: {e}")
 
 if __name__ == "__main__":
     fire.Fire(main)
