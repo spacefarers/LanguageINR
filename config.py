@@ -15,7 +15,7 @@ batch_size = 1
 # VOLUME_DIMS = [301, 324, 56]
 # TRANSFER_FUNCTION_PATH = "./paraview_tf/lobster.json"
 
-VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/bonsai_256x256x256_uint8_float32_normalized.raw"
+VOLUME_PATH = "data/bonsai_256x256x256_uint8_float32_normalized.raw"
 VOLUME_DIMS = [256, 256, 256]
 TRANSFER_FUNCTION_PATH = "./paraview_tf/bonsai.json"
 
