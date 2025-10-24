@@ -9,3 +9,5 @@ nerfacc
 torchvision
 imageio
 fire
+open-clip-torch
+ninja

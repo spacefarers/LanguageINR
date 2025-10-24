@@ -29,7 +29,7 @@ def main(mode="stage2"):
     else:
         model = NGP_TCNN(opt).to(device)
         model.load_state_dict(torch.load("./models/stage1_ngp_tcnn.pth", map_location=device))
-        vol = np.fromfile("./results/stage1/prediction.raw", dtype=np_dtype).reshape(VOLUME_DIMS)
+        vol, dims = stage1.load_volume_data()
     model.eval()
 
     if mode == "render" or mode == "all":
@@ -57,7 +57,7 @@ def main(mode="stage2"):
 
         # Training configuration
         num_steps = 500
-        image_hw = (256, 256)
+        image_hw = (128, 128)
         hidden_dim = 256
         n_hidden = 3
         latent_dim = 512
@@ -96,9 +96,9 @@ def main(mode="stage2"):
             model_size="large",
             points_per_side=32,
             points_per_batch=64,
-            pred_iou_thresh=0.3,
-            stability_score_thresh=0.86,
-            box_nms_thresh=0.9,
+            pred_iou_thresh=0.7,
+            stability_score_thresh=0.92,
+            box_nms_thresh=0.7,
         )
         print("  SAM2 generator ready")
 
@@ -110,8 +110,8 @@ def main(mode="stage2"):
         # Train semantic layer
         print(f"\nStarting training for {num_steps} steps...\n")
 
-        # Use smaller batch size to avoid CUDA errors
-        batch_size = 2048  # Reduced from default 8192 to avoid CUDA kernel issues
+        # Use smaller batch size to avoid CUDA errors and VRAM issues
+        batch_size = 512
 
         history = stage2.train_semantic_layer(
             grid_inr=model,
@@ -123,7 +123,6 @@ def main(mode="stage2"):
             transfer_function=transfer_fn,
             num_steps=num_steps,
             image_hw=image_hw,
-            print_every=25,
             loss_type="cosine",
             batch_size=batch_size,
         )

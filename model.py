@@ -46,25 +46,38 @@ class SemanticLayer(nn.Module):
         self.head_p = nn.Linear(hidden_dim, latent_dim)  # Part
         self.head_w = nn.Linear(hidden_dim, latent_dim)  # Whole
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, head: str = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass through semantic layer.
 
         Args:
             x: [N, 4] tensor of (x, y, z, value)
+            head: Optional head to compute ('s', 'p', 'w'). If None, computes all three.
 
         Returns:
-            Tuple of (feat_s, feat_p, feat_w), each [N, 512]
+            If head is None: Tuple of (feat_s, feat_p, feat_w), each [N, 512]
+            If head is specified: Returns only the requested head as (feat, None, None)
+                                  or similar pattern based on which head
         """
         # Shared trunk
         features = self.trunk(x)
 
-        # Three separate heads
-        feat_s = self.head_s(features)
-        feat_p = self.head_p(features)
-        feat_w = self.head_w(features)
-
-        return feat_s, feat_p, feat_w
+        # If specific head requested, only compute that one (saves memory)
+        if head == 's':
+            feat_s = self.head_s(features)
+            return feat_s, None, None
+        elif head == 'p':
+            feat_p = self.head_p(features)
+            return None, feat_p, None
+        elif head == 'w':
+            feat_w = self.head_w(features)
+            return None, None, feat_w
+        else:
+            # Compute all three heads (for loss computation during training)
+            feat_s = self.head_s(features)
+            feat_p = self.head_p(features)
+            feat_w = self.head_w(features)
+            return feat_s, feat_p, feat_w
 
 
 class NGP_TCNN(nn.Module):

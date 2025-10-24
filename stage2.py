@@ -6,9 +6,13 @@ Future sections will add SAM segmentation and CLIP encoding.
 """
 
 import torch
+import inspect
 import numpy as np
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 import os
+from pathlib import Path
+import imageio
+import colorsys
 
 from config import device, dtype, VOLUME_DIMS, opt
 import render
@@ -22,6 +26,7 @@ def generate_random_render(
     grid_inr: "nn.Module",
     transfer_function: render.ParaViewTransferFunction,
     image_hw: Tuple[int, int] = (256, 256),
+    clip_plane: Optional[Tuple[torch.Tensor, float]] = None,
 ) -> Tuple[torch.Tensor, render.Camera]:
     """
     Generate a render from a random perspective using existing render.py methods.
@@ -30,12 +35,14 @@ def generate_random_render(
     1. Samples a random camera using render.sample_random_perspective()
     2. Samples the INR to get a dense scalar volume
     3. Applies the transfer function to get RGBA (using render.ParaViewTransferFunction)
-    4. Renders using render.render_with_nerfacc()
+    4. [NEW] Applies stochastic geometric clipping to the RGBA volume
+    5. Renders using render.render_with_nerfacc()
 
     Args:
         grid_inr: The Stage 1 NGP model
         transfer_function: render.ParaViewTransferFunction instance
         image_hw: Output image resolution (height, width)
+        clip_plane: [NEW] Optional (normal_vec, offset) tuple for 3D clipping
 
     Returns:
         Tuple of (image, camera):
@@ -54,6 +61,7 @@ def generate_random_render(
         polar_min_deg=20.0,
         polar_max_deg=160.0,
     )
+    camera.dist = camera.dist * 0.75
 
     # 2. Sample the INR to get a dense scalar volume
     x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
@@ -89,7 +97,27 @@ def generate_random_render(
     alpha = alpha.clamp(0, 0.999)  # render_with_nerfacc expects alpha < 1
     rgba_volume = torch.cat([rgb, alpha], dim=-1).contiguous()
 
-    # 4. Render using render.render_with_nerfacc()
+    # 4. [NEW] Stochastic Geometric Clipping
+    if clip_plane is not None:
+        import torch.nn.functional as F
+
+        # Unpack the plane defined in normalized [-1, 1] coordinates
+        normal, offset = clip_plane
+        nx, ny, nz = normal[0], normal[1], normal[2]
+        d = offset
+
+        # `coords` is [D, H, W, 3] with (x, y, z) in [-1, 1] (from line 72)
+        # Calculate signed distance for all voxels from the plane
+        dist = (coords[..., 0] * nx + coords[..., 1] * ny + coords[..., 2] * nz) - d
+
+        # Create mask for voxels "in front of" the plane
+        clip_mask = (dist > 0)  # Shape [D, H, W]
+
+        # Apply clip by zeroing-out alpha (making them transparent)
+        # Use [..., 3] to first select the alpha channel, then apply the mask
+        rgba_volume[..., 3][clip_mask] = 0.0
+
+    # 5. Render using render.render_with_nerfacc()
     rendered_img = render.render_with_nerfacc(
         rgba_volume=rgba_volume,
         camera=camera,
@@ -109,7 +137,7 @@ def generate_random_render(
 # ==============================================================================
 
 def build_sam2_generator(
-    model_size: str = "large",
+    model_size: str = "small",
     points_per_side: int = 32,
     points_per_batch: int = 64,
     pred_iou_thresh: float = 0.7,
@@ -166,7 +194,7 @@ def build_sam2_generator(
 def segment_image_with_sam2(
     image: torch.Tensor,
     sam_generator: "SAM2AutomaticMaskGenerator" = None,
-    model_size: str = "large",
+    model_size: str = "small",
 ) -> List[Dict]:
     """
     Segment an image using SAM2AutomaticMaskGenerator.
@@ -239,6 +267,65 @@ def partition_masks_by_area(
 
     return groups
 
+COLOR_PALETTE = [
+    np.array([230, 25, 75], dtype=np.uint8),   # Red
+    np.array([60, 180, 75], dtype=np.uint8),  # Green
+    np.array([255, 225, 25], dtype=np.uint8), # Yellow
+    np.array([0, 130, 200], dtype=np.uint8),  # Blue
+    np.array([245, 130, 48], dtype=np.uint8),  # Orange
+]
+
+def save_debug_images(
+    step: int,
+    rendered_image: torch.Tensor,
+    groups: Dict[str, List[Dict]],
+    output_dir: str = "results/stage2/debugviews",
+) -> None:
+    """
+    Save rendered image and SAM masks to PNG files for debugging.
+
+    Args:
+        step: Training step number
+        rendered_image: [H, W, 3] RGB tensor in range [0, 1]
+        groups: Dictionary with keys 's', 'p', 'w', each containing list of masks
+        output_dir: Directory to save debug images
+    """
+    # Create output directory
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Convert image to uint8 for saving
+    image_np = (rendered_image.cpu().numpy() * 255).astype(np.uint8)
+
+    # Save rendered image
+    image_path = os.path.join(output_dir, f"step_{step:05d}_rendered.png")
+    imageio.imwrite(image_path, image_np)
+
+    # Get image dimensions
+    H, W = rendered_image.shape[:2]
+
+    # Save masks for each hierarchy level
+    for level, level_name in [('s', 'subpart'), ('p', 'part'), ('w', 'whole')]:
+        masks = groups[level]
+
+        if len(masks) == 0:
+            continue
+
+        # Create a composite mask image where each mask is colored differently
+        mask_composite = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # Assign different colors to different masks
+        for mask_idx, mask_data in enumerate(masks):
+            seg = mask_data['segmentation']
+
+            color = COLOR_PALETTE[mask_idx % len(COLOR_PALETTE)]
+
+            # Apply color to mask pixels
+            mask_composite[seg] = color
+
+        # Save mask composite
+        mask_path = os.path.join(output_dir, f"step_{step:05d}_masks_{level}.png")
+        imageio.imwrite(mask_path, mask_composite)
+
 
 # ==============================================================================
 # CLIP feature generation
@@ -258,12 +345,23 @@ def load_clip_model(model_name: str = "ViT-B/32"):
     """
     import open_clip
 
+    kwargs = {
+        "model_name": model_name,
+        "pretrained": "openai",
+        "device": device,
+    }
+    try:
+        sig = inspect.signature(open_clip.create_model_and_transforms)
+    except (TypeError, ValueError):
+        sig = None
+    if sig is not None:
+        if "force_quick_gelu" in sig.parameters:
+            kwargs["force_quick_gelu"] = True
+        elif "quick_gelu" in sig.parameters:
+            kwargs["quick_gelu"] = True
+
     # Load model
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name=model_name,
-        pretrained="openai",
-        device=device,
-    )
+    model, _, preprocess = open_clip.create_model_and_transforms(**kwargs)
     model.eval()
 
     return model, preprocess
@@ -378,10 +476,11 @@ def train_semantic_layer(
     clip_preprocess,
     transfer_function: render.ParaViewTransferFunction,
     num_steps: int = 100,
-    image_hw: Tuple[int, int] = (512, 512),
-    print_every: int = 10,
+    image_hw: Tuple[int, int] = (128, 128),
     loss_type: str = "cosine",
-    batch_size: int = 8192,
+    batch_size: int = 1024,  # Reduced from 8192 to save VRAM
+    save_debug_every: int = 1,  # Save debug images every N steps
+    clip_prob: float = 0.5,
 ) -> Dict:
     """
     Train the semantic layer by comparing rendered semantic features against CLIP features.
@@ -404,9 +503,10 @@ def train_semantic_layer(
         transfer_function: ParaViewTransferFunction
         num_steps: Number of training steps
         image_hw: Output image resolution (height, width)
-        print_every: Print loss every N steps
         loss_type: Loss function ("cosine" for cosine similarity, "l2" for L2 distance)
         batch_size: Number of rays to process per batch in rendering (default 8192)
+        save_debug_every: Save debug images every N steps to results/stage2/debugviews
+        clip_prob: [NEW] Probability of applying a random geometric clip to each render
 
     Returns:
         Dictionary with training history:
@@ -416,6 +516,39 @@ def train_semantic_layer(
         - 'loss_w': List of whole-level losses
     """
     import torch.nn.functional as F
+    from tqdm import tqdm
+    import neptune
+    from keys import NEPTUNE_API_TOKEN, PROJECT
+
+    # Initialize Neptune
+    run = neptune.init_run(
+        project=PROJECT,
+        api_token=NEPTUNE_API_TOKEN,
+        name="Stage2-Semantic-Training",
+        tags=["stage2", "semantic", "clip", "sam2"],
+    )
+
+    # Log hyperparameters
+    optimizer_params = optimizer.param_groups[0]
+    run["hyperparameters"] = {
+        "num_steps": num_steps,
+        "image_hw": str(image_hw),
+        "batch_size": batch_size,
+        "loss_type": loss_type,
+        "clip_prob": clip_prob,
+        "semantic_layer/hidden_dim": semantic_layer.hidden_dim,
+        "semantic_layer/n_hidden": semantic_layer.n_hidden,
+        "semantic_layer/latent_dim": semantic_layer.latent_dim,
+        "optimizer/lr": optimizer_params['lr'],
+        "optimizer/weight_decay": optimizer_params.get('weight_decay', 0.0),
+        "optimizer/name": optimizer.__class__.__name__,
+    }
+
+    # Log model parameters count
+    total_params = sum(p.numel() for p in semantic_layer.parameters())
+    trainable_params = sum(p.numel() for p in semantic_layer.parameters() if p.requires_grad)
+    run["model/total_parameters"] = total_params
+    run["model/trainable_parameters"] = trainable_params
 
     # Ensure grid_inr is frozen
     for param in grid_inr.parameters():
@@ -429,8 +562,19 @@ def train_semantic_layer(
         'loss_w': [],
     }
 
-    for step in range(num_steps):
+    pbar = tqdm(range(num_steps), desc="Training", ncols=100)
+    for step in pbar:
         optimizer.zero_grad()
+
+        # --- [NEW] Define a single, synchronized clip plane for this step ---
+        clip_plane = None
+        if torch.rand(1).item() < clip_prob:
+            # Random normal vector (uniformly distributed on unit sphere)
+            normal = F.normalize(torch.randn(3, device=device, dtype=dtype), dim=0)
+            # Random offset 'd' in range [-0.8, 0.8] (relative to [-1, 1] coords)
+            offset = (torch.rand(1, device=device, dtype=dtype) * 1.6 - 0.8).item()
+            clip_plane = (normal, offset)
+        # --- End [NEW] ---
 
         # ====================================================================
         # Path 1: Generate random render and CLIP ground truth
@@ -441,15 +585,14 @@ def train_semantic_layer(
             grid_inr=grid_inr,
             transfer_function=transfer_function,
             image_hw=image_hw,
+            clip_plane=clip_plane,
         )
 
         # Segment with SAM2
         masks = segment_image_with_sam2(img, sam_generator=sam_generator)
-        print(f"Step {step+1}/{num_steps}: Generated {len(masks)} masks", flush=True)
 
         # Partition into hierarchies
         groups = partition_masks_by_area(masks)
-        print(f"  Masks partitioned into: s={len(groups['s'])}, p={len(groups['p'])}, w={len(groups['w'])}", flush=True)
 
         # Generate CLIP features (ground truth)
         clip_feat_s, clip_feat_p, clip_feat_w = generate_clip_features_from_masks(
@@ -458,7 +601,6 @@ def train_semantic_layer(
             clip_model=clip_model,
             clip_preprocess=clip_preprocess,
         )
-        print(f"  CLIP features generated for levels: s={clip_feat_s.sum().item():.4f}, p={clip_feat_p.sum().item():.4f}, w={clip_feat_w.sum().item():.4f}", flush=True)
 
         # ====================================================================
         # Path 2: Render semantic features from the neural network
@@ -470,8 +612,8 @@ def train_semantic_layer(
             camera=camera,
             image_hw=image_hw,
             batch_size=batch_size,
+            clip_plane=clip_plane,
         )
-        print(f"  Rendered semantic features: s={render_feat_s.sum().item():.4f}, p={render_feat_p.sum().item():.4f}, w={render_feat_w.sum().item():.4f}", flush=True)
 
         # ====================================================================
         # Compute loss between rendered and CLIP features
@@ -538,13 +680,35 @@ def train_semantic_layer(
         history['loss_p'].append(loss_p.item())
         history['loss_w'].append(loss_w.item())
 
-        if (step + 1) % print_every == 0:
-            print(
-                f"Step {step + 1:4d}/{num_steps} | "
-                f"Loss: {total_loss.item():.4f} | "
-                f"s={loss_s.item():.4f} p={loss_p.item():.4f} w={loss_w.item():.4f} | "
-                f"Masks: s={len(groups['s'])} p={len(groups['p'])} w={len(groups['w'])}"
+        # Log to Neptune
+        run["train/loss"].append(total_loss.item())
+        run["train/loss_s"].append(loss_s.item())
+        run["train/loss_p"].append(loss_p.item())
+        run["train/loss_w"].append(loss_w.item())
+        run["train/masks_s"].append(len(groups['s']))
+        run["train/masks_p"].append(len(groups['p']))
+        run["train/masks_w"].append(len(groups['w']))
+        run["train/total_masks"].append(len(masks))
+
+        # Save debug images periodically
+        if save_debug_every > 0 and step % save_debug_every == 0:
+            save_debug_images(
+                step=step + 1,
+                rendered_image=img,
+                groups=groups,
             )
+
+        # Update progress bar with loss information
+        pbar.set_postfix({
+            'loss': f'{total_loss.item():.4f}',
+            's': f'{loss_s.item():.3f}',
+            'p': f'{loss_p.item():.3f}',
+            'w': f'{loss_w.item():.3f}',
+            'masks': f'{len(groups["s"])}|{len(groups["p"])}|{len(groups["w"])}'
+        })
+
+    # Stop Neptune run
+    run.stop()
 
     return history
 
@@ -559,6 +723,7 @@ def render_semantics(
     camera: render.Camera,
     image_hw: Tuple[int, int] = (256, 256),
     batch_size: int = 8192,
+    clip_plane: Optional[Tuple[torch.Tensor, float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Render semantic features using the adapted render_with_nerfacc.
@@ -572,6 +737,7 @@ def render_semantics(
         camera: Camera for rendering viewpoint
         image_hw: Output image resolution (height, width)
         batch_size: Number of rays to process per batch
+        clip_plane: [NEW] Optional (normal_vec, offset) tuple for 3D clipping
 
     Returns:
         Tuple of (feat_s, feat_p, feat_w), each [H, W, 512] semantic feature maps
@@ -579,19 +745,9 @@ def render_semantics(
     X, Y, Z = VOLUME_DIMS
     D_vol, H_vol, W_vol = Z, Y, X
 
-    print(
-        "[render_semantics] start | hw="
-        f"{image_hw} volume={D_vol}x{H_vol}x{W_vol} batch_size={batch_size}",
-        flush=True,
-    )
-
     # Get INR value range for normalization
     v_min = grid_inr.min()
     v_max = grid_inr.max()
-    print(
-        f"[render_semantics] volume range min={v_min.item():.6f} max={v_max.item():.6f}",
-        flush=True,
-    )
 
     def make_feature_fn(head_key: str):
         """
@@ -621,8 +777,6 @@ def render_semantics(
                 (pts[:, 2] / (D_vol - 1.0)) * 2.0 - 1.0 if D_vol > 1 else torch.zeros_like(pts[:, 2]),
             ], dim=-1).clamp(-1.0, 1.0)
 
-            print(f"[render_semantics] head={head_key} pts={pts.shape[0]}", flush=True)
-
             # Query INR for scalar values in chunks to avoid CUDA errors
             with torch.no_grad():
                 N = pts_norm.shape[0]
@@ -634,11 +788,6 @@ def render_semantics(
                     values_list = []
                     for i in range(0, N, chunk_size):
                         chunk = pts_norm[i:i+chunk_size]
-                        print(
-                            f"[render_semantics] head={head_key} INR chunk "
-                            f"{i}:{i+chunk_size}",
-                            flush=True,
-                        )
                         values_chunk = grid_inr(chunk)
                         values_list.append(values_chunk)
                     values = torch.cat(values_list, dim=0) if len(values_list) > 1 else values_list[0]
@@ -650,49 +799,55 @@ def render_semantics(
             # Create input for semantic layer: (x, y, z, value)
             semantic_input = torch.cat([pts_norm, values_norm], dim=-1)  # [N, 4]
 
-            # Get semantic features from all three heads - with chunking for memory efficiency
+            # Get semantic features from ONLY the requested head for memory efficiency
             N_sem = semantic_input.shape[0]
             if N_sem == 0:
-                feat_s = torch.zeros((0, 512), device=device, dtype=dtype)
-                feat_p = torch.zeros((0, 512), device=device, dtype=dtype)
-                feat_w = torch.zeros((0, 512), device=device, dtype=dtype)
+                features = torch.zeros((0, 512), device=device, dtype=dtype)
             else:
-                chunk_size_sem = 2048  # Process semantic layer in chunks
-                feat_s_list, feat_p_list, feat_w_list = [], [], []
+                # Process in smaller chunks to avoid OOM
+                chunk_size_sem = 512  # Reduced from 2048 to save memory
+                feat_list = []
                 for i in range(0, N_sem, chunk_size_sem):
                     chunk = semantic_input[i:i+chunk_size_sem]
-                    fs, fp, fw = semantic_layer(chunk)
-                    feat_s_list.append(fs)
-                    feat_p_list.append(fp)
-                    feat_w_list.append(fw)
-                feat_s = torch.cat(feat_s_list, dim=0) if len(feat_s_list) > 1 else feat_s_list[0]
-                feat_p = torch.cat(feat_p_list, dim=0) if len(feat_p_list) > 1 else feat_p_list[0]
-                feat_w = torch.cat(feat_w_list, dim=0) if len(feat_w_list) > 1 else feat_w_list[0]
+                    # Only compute the requested head (saves memory and computation!)
+                    fs, fp, fw = semantic_layer(chunk, head=head_key)
 
-            # Select the requested head
-            if head_key == 's':
-                features = feat_s
-            elif head_key == 'p':
-                features = feat_p
-            else:  # 'w'
-                features = feat_w
+                    # Extract the non-None result
+                    if head_key == 's':
+                        feat_list.append(fs)
+                    elif head_key == 'p':
+                        feat_list.append(fp)
+                    else:  # 'w'
+                        feat_list.append(fw)
 
-            # Compute density from normalized value
+                # Concatenate all chunks
+                features = torch.cat(feat_list, dim=0) if len(feat_list) > 1 else feat_list[0]
+                del feat_list  # Free list memory
+
+            # --- [NEW] Apply synchronized geometric clipping ---
+            if clip_plane is not None:
+                normal, offset = clip_plane
+                nx, ny, nz = normal[0], normal[1], normal[2]
+                d = offset
+
+                # pts_norm is [N, 3] (x, y, z) in [-1, 1]
+                dist = (pts_norm[:, 0] * nx + pts_norm[:, 1] * ny + pts_norm[:, 2] * nz) - d
+                clip_mask = (dist > 0)  # [N]
+
+                # Set density-contributing value to 0 for clipped points
+                # This will make their alpha and sigma zero
+                values_norm[clip_mask] = 0.0
+            # --- End [NEW] ---
+
+            # Compute density from (potentially modified) normalized value
             alphas = values_norm.squeeze(-1).clamp(0, 0.999)
             sigmas = -torch.log1p(-alphas)
-
-            print(
-                f"[render_semantics] head={head_key} features={features.shape} "
-                f"sigmas={sigmas.shape}",
-                flush=True,
-            )
 
             return features, sigmas
 
         return feature_fn
 
     # Render each hierarchy level separately
-    print("[render_semantics] rendering subpart head", flush=True)
     feat_s_img = render.render_with_nerfacc(
         camera=camera,
         hw=image_hw,
@@ -702,9 +857,9 @@ def render_semantics(
         volume_dims=(D_vol, H_vol, W_vol),
         output_channels=512
     )
-    print("[render_semantics] rendering subpart head finished", flush=True)
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()  # Free memory before next render
 
-    print("[render_semantics] rendering part head", flush=True)
     feat_p_img = render.render_with_nerfacc(
         camera=camera,
         hw=image_hw,
@@ -714,9 +869,9 @@ def render_semantics(
         volume_dims=(D_vol, H_vol, W_vol),
         output_channels=512
     )
-    print("[render_semantics] rendering part head finished", flush=True)
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()  # Free memory before next render
 
-    print("[render_semantics] rendering whole head", flush=True)
     feat_w_img = render.render_with_nerfacc(
         camera=camera,
         hw=image_hw,
@@ -726,7 +881,8 @@ def render_semantics(
         volume_dims=(D_vol, H_vol, W_vol),
         output_channels=512
     )
-    print("[render_semantics] rendering whole head finished", flush=True)
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()  # Free memory after all renders
 
     return feat_s_img, feat_p_img, feat_w_img
 

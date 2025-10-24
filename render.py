@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import nerfacc
+from nerfacc import render_weight_from_alpha
 from config import device, dtype, VOLUME_DIMS
 import imageio
 import random
@@ -192,13 +193,6 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
         output_channels: Number of output channels (3 for RGB, 512 for semantic)
     """
 
-    print(
-        "[render_with_nerfacc] start | "
-        f"hw={hw} batch_size={batch_size} output_channels={output_channels} "
-        f"mode={'rgba' if rgba_volume is not None else 'feature_fn'}",
-        flush=True,
-    )
-
     if rgba_volume is not None:
         # Standard RGBA volume rendering
         if rgba_volume.dim() != 4 or rgba_volume.shape[-1] != 4:
@@ -207,20 +201,12 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
         # Arrange for grid_sample: [1, 4, D, H, W]
         vol = rgba_volume.permute(3, 0, 1, 2).unsqueeze(0)
         depth, height, width = (int(vol.shape[-3]), int(vol.shape[-2]), int(vol.shape[-1]))
-        print(
-            f"[render_with_nerfacc] rgba volume shape (depth={depth}, height={height}, width={width})",
-            flush=True,
-        )
     else:
         # Custom feature rendering
         if feature_fn is None or volume_dims is None:
             raise ValueError("Must provide either rgba_volume or (feature_fn + volume_dims)")
         depth, height, width = volume_dims
         vol = None
-        print(
-            f"[render_with_nerfacc] feature mode volume dims={volume_dims}",
-            flush=True,
-        )
 
     # Bounding box is expressed in X,Y,Z order (width, height, depth)
     extent_xyz = torch.tensor([
@@ -248,10 +234,6 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
     estimator.binaries = torch.ones_like(estimator.binaries, device=device)
 
     def rgb_sigma_from_vol(t_starts, t_ends, ray_indices, o, d):
-        print(
-            f"[render_with_nerfacc] rgb_sigma_from_vol | rays={ray_indices.shape[0]}",
-            flush=True,
-        )
         pts = o[ray_indices] + d[ray_indices] * ((t_starts + t_ends)[:, None] * 0.5)
 
         if feature_fn is not None:
@@ -297,10 +279,6 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
         batch_origins = origins[batch_start:batch_end].contiguous()
         batch_dirs = dirs[batch_start:batch_end].contiguous()
         batch_idx = batch_start // batch_size
-        print(
-            f"[render_with_nerfacc] batch {batch_idx} | rays={batch_end - batch_start}",
-            flush=True,
-        )
 
         t0 = time.time()
         # Use larger render_step_size to reduce sample count and prevent CUDA kernel hang
@@ -309,21 +287,11 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
         #   step_size=2.0 -> ~440 samples/ray (high quality RGB)
         #   step_size=8.0 -> ~110 samples/ray (faster, lower quality)
         step_size = 4.0 if feature_fn is not None else 2.0
-        print(
-            f"[render_with_nerfacc] batch {batch_idx} calling sampling | "
-            f"max_dist={max_dist:.1f} step_size={step_size:.1f} expected_samples/ray~{int(max_dist/step_size)}",
-            flush=True,
-        )
         batch_ray_indices, batch_t_starts, batch_t_ends = estimator.sampling(
             batch_origins, batch_dirs,
             near_plane=0.0,
             far_plane=max_dist,
             render_step_size=step_size,
-        )
-        print(
-            f"[render_with_nerfacc] batch {batch_idx} sampling finished | "
-            f"samples={batch_ray_indices.shape[0]}",
-            flush=True,
         )
         total_time['sampling'] += time.time() - t0
 
@@ -343,7 +311,6 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
                 rgb_sigma_fn=batch_rgb_sigma_fn,
                 render_bkgd=render_bkgd
             )
-            print(f"[render_with_nerfacc] batch {batch_idx} nerfacc.rendering done", flush=True)
             total_time['compose'] += time.time() - t0
             colors[batch_start:batch_end] = batch_colors
         else:
@@ -358,41 +325,38 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
             # Compute segment lengths for opacity calculation
             segment_lengths = (batch_t_ends - batch_t_starts).clamp_min(1e-10)
 
-            # Compute transmittance and weights using nerfacc's approach
-            # transmittance = exp(-cumsum(sigma * dt))
-            # weight = transmittance * (1 - exp(-sigma * dt))
+            # Compute alphas (opacity of each sample)
             alphas = 1.0 - torch.exp(-sigmas * segment_lengths)  # [N]
+
+            # Compute proper transmittance-weighted alphas for front-to-back compositing
+            # This ensures occluded samples don't incorrectly influence pixels
+            # weight_i = T_i * alpha_i, where T_i = prod_{j<i}(1 - alpha_j)
+            # render_weight_from_alpha returns (weights, transmittance_packed)
+            weights, _ = render_weight_from_alpha(
+                alphas,
+                ray_indices=batch_ray_indices,
+                n_rays=batch_origins.shape[0]
+            )  # [N] - now includes transmittance
 
             # Use nerfacc's accumulate_along_rays for efficient composition
             # This is a highly optimized CUDA kernel
             batch_colors = nerfacc.accumulate_along_rays(
-                weights=alphas,  # [N]
+                weights=weights,  # [N] - proper transmittance-weighted contribution
                 values=features,  # [N, C]
                 ray_indices=batch_ray_indices,
                 n_rays=batch_origins.shape[0]
             )
-            print(f"[render_with_nerfacc] batch {batch_idx} accumulate_along_rays done", flush=True)
             total_time['compose'] += time.time() - t0
 
             colors[batch_start:batch_end] = batch_colors
 
-    # Print timing breakdown for semantic rendering
-    if output_channels != 3:
-        total = sum(total_time.values())
-        print(f"  [render_with_nerfacc] Total: {total:.3f}s | " +
-              f"sampling: {total_time['sampling']:.3f}s ({100*total_time['sampling']/total:.1f}%) | " +
-              f"feature: {total_time['feature']:.3f}s ({100*total_time['feature']/total:.1f}%) | " +
-              f"compose: {total_time['compose']:.3f}s ({100*total_time['compose']/total:.1f}%)", flush=True)
-
     # Reshape to [H, W, C]
     result = colors.view(hw[0], hw[1], output_channels)
-    print("[render_with_nerfacc] finished composition, reshaping output", flush=True)
 
     # Only clamp for RGB output
     if output_channels == 3:
         result = result.clamp(0, 1)
 
-    print("[render_with_nerfacc] done", flush=True)
     return result
 
 def generate_volume_render_png(volume: np.ndarray,

@@ -12,10 +12,8 @@ import sys
 import os
 import numpy as np
 import torch
-import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-from sklearn.decomposition import PCA
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -44,10 +42,8 @@ except ImportError:
 # Import from stage2
 from config import device
 from stage2 import (
-    build_sam_generator,
-    load_clipseg_model,
-    clipseg_image_encoder,
-    _sam_partition_masks
+    build_sam2_generator,
+    partition_masks_by_area
 )
 
 
@@ -207,11 +203,10 @@ class SAMProcessor(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, image_path: str, sam_gen, clipseg_model, max_regions: int = 128):
+    def __init__(self, image_path: str, sam_gen, max_regions: int = 128):
         super().__init__()
         self.image_path = image_path
         self.sam_gen = sam_gen
-        self.clipseg_model = clipseg_model
         self.max_regions = max_regions
 
     def run(self):
@@ -234,51 +229,22 @@ class SAMProcessor(QThread):
             self.progress.emit(f"Generated {len(masks)} masks. Partitioning into hierarchies...")
 
             # Partition into hierarchies
-            groups = _sam_partition_masks(masks)
+            groups = partition_masks_by_area(masks)
 
             self.progress.emit("Building hierarchy tree...")
 
             # Build tree structure
             tree = build_hierarchy_tree(groups)
 
-            self.progress.emit("Generating CLIPSeg embeddings...")
-
-            # Generate hierarchy maps
-            H, W = img_tensor.shape[:2]
-            targets: Dict[str, torch.Tensor] = {}
-
-            for key in ("s", "p", "w"):
-                hierarchy_name = {"s": "Small", "p": "Part", "w": "Whole"}[key]
-                self.progress.emit(f"Processing {hierarchy_name} regions ({len(groups[key])} masks)...")
-
-                L = torch.zeros((H, W, 512), device=device, dtype=torch.float32)
-                count = 0
-
-                for m in groups[key]:
-                    if count >= self.max_regions:
-                        break
-
-                    seg = torch.from_numpy(m["segmentation"]).to(device=device, dtype=torch.float32)
-                    if seg.sum() < 8:
-                        continue
-
-                    masked = img_tensor.to(device) * seg.unsqueeze(-1)
-                    z = clipseg_image_encoder(self.clipseg_model, masked)
-                    z = F.normalize(z, dim=-1)
-                    L[seg > 0.5] = z
-                    count += 1
-
-                targets[key] = L.cpu()
-
             self.progress.emit("Processing complete!")
 
             # Return results
+            H, W = img_tensor.shape[:2]
             result = {
                 'image': img_np,
                 'image_tensor': img_tensor.cpu(),
                 'masks': masks,
                 'groups': groups,
-                'targets': targets,
                 'tree': tree,
                 'stats': self._compute_stats(groups, H, W, tree)
             }
@@ -392,7 +358,6 @@ class SAMDemoWindow(QMainWindow):
         super().__init__()
 
         self.sam_gen = None
-        self.clipseg_model = None
         self.current_result = None
         self.selected_node = None
 
@@ -513,31 +478,19 @@ class SAMDemoWindow(QMainWindow):
         viz_layout = QGridLayout(viz_widget)
 
         self.small_mask_label = ImageLabel("Small - Mask")
-        self.small_pca_label = ImageLabel("Small - PCA")
         self.part_mask_label = ImageLabel("Part - Mask")
-        self.part_pca_label = ImageLabel("Part - PCA")
         self.whole_mask_label = ImageLabel("Whole - Mask")
-        self.whole_pca_label = ImageLabel("Whole - PCA")
 
-        viz_layout.addWidget(QLabel("<b>Small</b>", alignment=Qt.AlignCenter), 0, 0, 1, 2)
-        viz_layout.addWidget(QLabel("Mask"), 1, 0)
-        viz_layout.addWidget(self.small_mask_label, 2, 0)
-        viz_layout.addWidget(QLabel("PCA"), 1, 1)
-        viz_layout.addWidget(self.small_pca_label, 2, 1)
+        viz_layout.addWidget(QLabel("<b>Small Regions</b>", alignment=Qt.AlignCenter), 0, 0)
+        viz_layout.addWidget(self.small_mask_label, 1, 0)
 
-        viz_layout.addWidget(QLabel("<b>Part</b>", alignment=Qt.AlignCenter), 3, 0, 1, 2)
-        viz_layout.addWidget(QLabel("Mask"), 4, 0)
-        viz_layout.addWidget(self.part_mask_label, 5, 0)
-        viz_layout.addWidget(QLabel("PCA"), 4, 1)
-        viz_layout.addWidget(self.part_pca_label, 5, 1)
+        viz_layout.addWidget(QLabel("<b>Part Regions</b>", alignment=Qt.AlignCenter), 2, 0)
+        viz_layout.addWidget(self.part_mask_label, 3, 0)
 
-        viz_layout.addWidget(QLabel("<b>Whole</b>", alignment=Qt.AlignCenter), 6, 0, 1, 2)
-        viz_layout.addWidget(QLabel("Mask"), 7, 0)
-        viz_layout.addWidget(self.whole_mask_label, 8, 0)
-        viz_layout.addWidget(QLabel("PCA"), 7, 1)
-        viz_layout.addWidget(self.whole_pca_label, 8, 1)
+        viz_layout.addWidget(QLabel("<b>Whole Regions</b>", alignment=Qt.AlignCenter), 4, 0)
+        viz_layout.addWidget(self.whole_mask_label, 5, 0)
 
-        right_panel.addTab(viz_widget, "Hierarchy Views")
+        right_panel.addTab(viz_widget, "Hierarchy Masks")
 
         # Add to splitter
         splitter.addWidget(images_scroll)
@@ -625,7 +578,7 @@ class SAMDemoWindow(QMainWindow):
         """)
 
     def init_models(self):
-        """Initialize SAM and CLIPSeg models."""
+        """Initialize SAM2 model."""
         self.status_label.setText("Loading models...")
         self.progress_bar.setRange(0, 0)
 
@@ -636,19 +589,16 @@ class SAMDemoWindow(QMainWindow):
             QApplication.processEvents()
 
             # Use SAM 2 with more points for better quality in demo
-            self.sam_gen = build_sam_generator(
-                model_size="large",  # Use large for best quality
-                sam_device=device,
+            self.sam_gen = build_sam2_generator(
+                model_size="small",  # Use large for best quality
                 points_per_side=32,  # Good coverage
                 points_per_batch=64,  # Fast processing
+                pred_iou_thresh=0.7,
+                stability_score_thresh=0.92,
+                box_nms_thresh=0.7,
             )
 
-            self.status_label.setText("Loading CLIPSeg model...")
-            QApplication.processEvents()
-            clipseg_weights = "weights/rd64-uni.pth"
-            self.clipseg_model = load_clipseg_model(clipseg_weights)
-
-            self.status_label.setText("Models loaded successfully! Using SAM 2 for better segmentation.")
+            self.status_label.setText("Models loaded successfully! Using SAM 2.")
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(100)
 
@@ -690,11 +640,8 @@ class SAMDemoWindow(QMainWindow):
         self.individual_masks_label.set_image(placeholder)
         self.selected_mask_label.set_image(placeholder)
         self.small_mask_label.set_image(placeholder)
-        self.small_pca_label.set_image(placeholder)
         self.part_mask_label.set_image(placeholder)
-        self.part_pca_label.set_image(placeholder)
         self.whole_mask_label.set_image(placeholder)
-        self.whole_pca_label.set_image(placeholder)
 
         self.tree_widget.clear()
         self.stats_text.clear()
@@ -713,7 +660,11 @@ class SAMDemoWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
 
         max_regions = int(self.max_regions_combo.currentText())
-        self.worker = SAMProcessor(self.image_path, self.sam_gen, self.clipseg_model, max_regions)
+        self.worker = SAMProcessor(
+            self.image_path,
+            self.sam_gen,
+            max_regions
+        )
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.process_complete)
         self.worker.error.connect(self.process_error)
@@ -777,45 +728,34 @@ class SAMDemoWindow(QMainWindow):
         self.individual_masks_label.set_image(mask_img.astype(np.uint8))
 
     def visualize_hierarchy(self, result: Dict[str, Any]):
-        """Visualize hierarchy results (mask and PCA)."""
-        targets = result['targets']
+        """Visualize hierarchy masks."""
+        groups = result['groups']
+        img = result['image']
+        H, W = img.shape[:2]
 
-        for key, mask_label, pca_label in [
-            ('s', self.small_mask_label, self.small_pca_label),
-            ('p', self.part_mask_label, self.part_pca_label),
-            ('w', self.whole_mask_label, self.whole_pca_label)
+        # Color scheme: Whole=Blue, Part=Green, Small=Red
+        colors = {
+            'w': np.array([0, 0, 255], dtype=np.float32),  # Blue
+            'p': np.array([0, 255, 0], dtype=np.float32),   # Green
+            's': np.array([255, 0, 0], dtype=np.float32)    # Red
+        }
+
+        for key, mask_label in [
+            ('s', self.small_mask_label),
+            ('p', self.part_mask_label),
+            ('w', self.whole_mask_label)
         ]:
-            target = targets[key].numpy()
-            H, W, D = target.shape
+            # Create visualization for this hierarchy level
+            mask_img = img.copy().astype(np.float32) * 0.3  # Dim the original image
 
-            # Create mask
-            mask = np.linalg.norm(target, axis=-1) > 0.01
-            mask_img = (mask * 255).astype(np.uint8)
-            mask_img = np.stack([mask_img] * 3, axis=-1)
-            mask_label.set_image(mask_img)
+            # Overlay all masks at this level
+            alpha = 0.7
+            for mask_data in groups[key]:
+                seg = mask_data['segmentation']
+                color = colors[key]
+                mask_img[seg] = mask_img[seg] * (1 - alpha) + color * alpha
 
-            # Create PCA visualization
-            embeddings_flat = target.reshape(-1, D)
-            valid_mask = np.linalg.norm(embeddings_flat, axis=1) > 0.01
-
-            if valid_mask.sum() > 3:
-                valid_embeddings = embeddings_flat[valid_mask]
-
-                pca = PCA(n_components=3)
-                pca_result = pca.fit_transform(valid_embeddings)
-
-                pca_normalized = (pca_result - pca_result.min(axis=0)) / (
-                    pca_result.max(axis=0) - pca_result.min(axis=0) + 1e-8
-                )
-
-                pca_img = np.zeros((H * W, 3))
-                pca_img[valid_mask] = pca_normalized
-                pca_img = pca_img.reshape(H, W, 3)
-                pca_img = (pca_img * 255).astype(np.uint8)
-
-                pca_label.set_image(pca_img)
-            else:
-                pca_label.set_image(np.zeros((H, W, 3), dtype=np.uint8))
+            mask_label.set_image(mask_img.astype(np.uint8))
 
     def populate_tree(self, tree: List[Dict]):
         """Populate the tree widget with hierarchy structure."""
@@ -921,10 +861,9 @@ class SAMDemoWindow(QMainWindow):
         text += "  - Blue = Whole regions (largest)\n"
         text += "  - Green = Part regions (medium)\n"
         text += "  - Red = Small regions (smallest)\n\n"
-        text += "Hierarchy Views (Right Tab):\n"
-        text += "  - Mask: Binary mask showing active pixels\n"
-        text += "  - PCA: 512D embeddings reduced to RGB\n"
-        text += "    (Different colors = semantically different regions)\n\n"
+        text += "Hierarchy Masks (Right Tab):\n"
+        text += "  - Shows masks for each hierarchy level separately\n"
+        text += "  - Each level is overlaid on the original image\n\n"
         text += "=" * 70 + "\n\n"
 
         for key in ['s', 'p', 'w']:
@@ -974,32 +913,15 @@ class SAMDemoWindow(QMainWindow):
                 if individual_img:
                     individual_img.save(str(output_dir / "individual_masks.png"))
 
-                # Hierarchy visualizations
-                for key, name in [('s', 'small'), ('p', 'part'), ('w', 'whole')]:
-                    target = self.current_result['targets'][key].numpy()
-                    H, W, D = target.shape
-
-                    mask = np.linalg.norm(target, axis=-1) > 0.01
-                    mask_img = (mask * 255).astype(np.uint8)
-                    Image.fromarray(mask_img, mode='L').save(output_dir / f"{name}_mask.png")
-
-                    embeddings_flat = target.reshape(-1, D)
-                    valid_mask = np.linalg.norm(embeddings_flat, axis=1) > 0.01
-
-                    if valid_mask.sum() > 3:
-                        valid_embeddings = embeddings_flat[valid_mask]
-                        pca = PCA(n_components=3)
-                        pca_result = pca.fit_transform(valid_embeddings)
-                        pca_normalized = (pca_result - pca_result.min(axis=0)) / (
-                            pca_result.max(axis=0) - pca_result.min(axis=0) + 1e-8
-                        )
-
-                        pca_img = np.zeros((H * W, 3))
-                        pca_img[valid_mask] = pca_normalized
-                        pca_img = pca_img.reshape(H, W, 3)
-                        pca_img = (pca_img * 255).astype(np.uint8)
-
-                        Image.fromarray(pca_img).save(output_dir / f"{name}_pca.png")
+                # Hierarchy mask visualizations
+                for label, name in [
+                    (self.small_mask_label, 'small'),
+                    (self.part_mask_label, 'part'),
+                    (self.whole_mask_label, 'whole')
+                ]:
+                    pixmap = label.pixmap()
+                    if pixmap:
+                        pixmap.save(str(output_dir / f"{name}_mask.png"))
 
                 # Save statistics
                 with open(output_dir / "statistics.txt", 'w') as f:

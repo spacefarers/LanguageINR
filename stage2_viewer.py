@@ -10,18 +10,18 @@ This viewer lets you:
 Design goals
 ------------
 * Pure-Python orchestration; all heavy lifting is delegated to the existing project
-  modules (renderer, CLIPSeg weights, INR + semantic head).
+  modules (renderer, CLIP model, INR + semantic head).
 * Robustness: gracefully handles missing GUI dependencies and provides a CLI fallback.
 * Efficiency: builds the similarity grid in depth chunks to keep VRAM bounded and
   supports optional local 3D feature aggregation.
 
 Key references (code this module relies on)
 -------------------------------------------
-- stage2.py: differentiable sampling of the INR, CLIPSeg utilities, and the
-  LangSemanticLayer definition (512‑D features). We rely on the shared embedding space
+- stage2.py: differentiable sampling of the INR, CLIP utilities, and the
+  SemanticLayer definition (512‑D features). We rely on the shared embedding space
   (visual/text) to compare per‑voxel semantic features with CLIP text embeddings.
 - render.py: Camera and render_with_nerfacc renderer.
-- model.py: NGP_TCNN hash‑grid INR.
+- model.py: NGP_TCNN hash‑grid INR and SemanticLayer with three hierarchical heads.
 
 Usage
 -----
@@ -35,13 +35,15 @@ Common flags:
     --stage1 ./models/stage1_ngp_tcnn.pth
     --head   ./models/stage2_semantic_head.pth
     --tf     ./paraview_tf/bonsai.json
-    --weights ./weights/rd64-uni.pth
-    --res 512 --threshold 0.90 --agg 3 --blob 0
+    --res 512 --threshold 0.30 --agg 3 --blob 0
 
 Notes
 -----
-* The semantic head predicts 512‑D features from (x,y,z,v_norm). We L2‑normalize
-  both text features and per‑voxel features and take cosine similarity.
+* The semantic head predicts 512‑D features from (x,y,z,v_norm) using three separate
+  heads (subpart, part, whole). We L2‑normalize both text features and per‑voxel
+  features and take cosine similarity.
+* In auto mode, the system selects the hierarchy level with the highest maximum
+  activation, matching the training scheme in stage2.py.
 * The highlight is applied by modulating the alpha channel of the RGBA volume and
   rendering with the shared NerfAcc renderer to guarantee view consistency.
 
@@ -63,9 +65,9 @@ import torch
 import torch.nn.functional as F
 
 # Project imports
-from config import device, opt, dtype, TRANSFER_FUNCTION_PATH  # type: ignore
-from model import NGP_TCNN  # type: ignore
-from render import Camera, render_with_nerfacc  # type: ignore
+from config import device, opt, dtype, TRANSFER_FUNCTION_PATH, VOLUME_DIMS  # type: ignore
+from model import NGP_TCNN, SemanticLayer  # type: ignore
+from render import Camera, render_with_nerfacc, ParaViewTransferFunction  # type: ignore
 import stage2  # type: ignore
 
 
@@ -75,7 +77,6 @@ import stage2  # type: ignore
 
 STAGE1_PATH_DEFAULT    = "./models/stage1_ngp_tcnn.pth"
 STAGE2_HEAD_DEFAULT    = "./models/stage2_semantic_head.pth"
-CLIPSEG_WEIGHTS_DEFAULT = "./weights/rd64-uni.pth"
 TRANSFER_FUNCTION_DEFAULT = TRANSFER_FUNCTION_PATH  # Imported from config.py
 
 
@@ -96,21 +97,74 @@ def _normalize(t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return F.normalize(t, dim=-1, eps=eps)
 
 
+def _dense_coords_for_inr(D: int, H: int, W: int, dev: torch.device) -> torch.Tensor:
+    """
+    Generate dense 3D coordinates in [-1, 1]^3 for sampling the INR.
+
+    Args:
+        D, H, W: Depth, Height, Width dimensions
+        dev: Device to create tensors on
+
+    Returns:
+        [D, H, W, 3] tensor with (x, y, z) coordinates
+    """
+    x = torch.linspace(-1, 1, W, device=dev, dtype=dtype)
+    y = torch.linspace(-1, 1, H, device=dev, dtype=dtype)
+    z = torch.linspace(-1, 1, D, device=dev, dtype=dtype)
+    zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
+    return torch.stack([xx, yy, zz], dim=-1)
+
+
+def relevancy_score(
+    features: torch.Tensor,
+    query: torch.Tensor,
+    canonical_negatives: List[torch.Tensor],
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Compute relevancy score by contrasting query with canonical negatives.
+
+    Args:
+        features: [N, D] normalized feature vectors
+        query: [D] normalized query vector
+        canonical_negatives: List of [D] normalized negative vectors
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        [N] relevancy scores
+    """
+    query = _normalize(query, eps=eps).view(1, -1)  # [1, D]
+    pos_sim = (features @ query.T).squeeze(-1)  # [N]
+
+    if not canonical_negatives:
+        return pos_sim
+
+    # Stack negatives: [K, D]
+    neg_stack = torch.stack(canonical_negatives, dim=0)  # [K, D]
+    neg_sim = features @ neg_stack.T  # [N, K]
+    neg_max = neg_sim.max(dim=-1).values  # [N]
+
+    # Contrast: emphasize query over negatives
+    return (pos_sim - neg_max).clamp(min=0.0)
+
+
 # ------------------------------
 # Core engine
 # ------------------------------
 
 class VolumeSemanticSearcher:
     """
-    Loads INR + semantic head + CLIPSeg, builds a text-conditioned similarity grid
+    Loads INR + semantic head + CLIP model, builds a text-conditioned similarity grid
     S(x,y,z), and renders highlight overlays via the project's NerfAcc renderer.
+
+    The semantic head has three hierarchical levels (subpart, part, whole).
+    In auto mode, selects the level with the highest maximum activation.
     """
 
     def __init__(
         self,
         stage1_path: str = STAGE1_PATH_DEFAULT,
         stage2_head_path: str = STAGE2_HEAD_DEFAULT,
-        clipseg_weights: str = CLIPSEG_WEIGHTS_DEFAULT,
         transfer_fn_path: str = TRANSFER_FUNCTION_DEFAULT,
         default_res_hw: Tuple[int, int] = (512, 512),
         default_samples: int = 16,
@@ -132,9 +186,9 @@ class VolumeSemanticSearcher:
             self.grid_inr.load_state_dict(ckpt)
         self.grid_inr.eval()
 
-        # ---- CLIPSeg (text/visual encoders share 512‑D space) ----
-        self.clipseg = stage2.load_clipseg_model(clipseg_weights, model_device=device)
-        self.clipseg.eval()
+        # ---- CLIP model (text/visual encoders share 512‑D space) ----
+        self.clip_model, self.clip_preprocess = stage2.load_clip_model(model_name="ViT-B/32")
+        self.clip_model.eval()
 
         # ---- Stage‑2 semantic head (latent) ----
         _ensure(os.path.exists(stage2_head_path), f"Missing Stage‑2 head at {stage2_head_path}")
@@ -147,12 +201,12 @@ class VolumeSemanticSearcher:
                     return int(state_dict[head_key].shape[0])
             _ensure(False, "Unable to infer latent dimension from Stage-2 head state dict")
         self.latent_dim = _infer_latent_dim(head_state)
-        self.semantic = stage2.LangSemanticLayer(hidden_dim=256, n_hidden=3, d=self.latent_dim).to(device)
+        self.semantic = SemanticLayer(hidden_dim=256, n_hidden=3, latent_dim=self.latent_dim).to(device)
         self.semantic.load_state_dict(head_state)
         self.semantic.eval()
 
         # ---- Transfer function ----
-        self.transfer_fn = stage2.ParaViewTransferFunction(transfer_fn_path)
+        self.transfer_fn = ParaViewTransferFunction(transfer_fn_path)
 
         # ---- Geometry ----
         self._Dv, self._Hv, self._Wv = map(int, self.grid_inr.get_volume_extents())
@@ -163,8 +217,7 @@ class VolumeSemanticSearcher:
         self._argmax_norm: Optional[torch.Tensor] = None # [3] in [-1,1] (x,y,z)
         self._v_norm: Optional[torch.Tensor] = None      # [D,H,W,1] float
         self._S_levels: Dict[str, torch.Tensor] = {}
-        self.hierarchy_mode: str = "auto"
-        self.use_canonical_negatives: bool = True
+        self.hierarchy_mode: str = "part"
         self._selected_level: Optional[str] = None
 
     def _ensure_scalar_field(self) -> torch.Tensor:
@@ -173,7 +226,7 @@ class VolumeSemanticSearcher:
             return self._v_norm
 
         Dv, Hv, Wv = self._Dv, self._Hv, self._Wv
-        coords = stage2._dense_coords_for_inr(Dv, Hv, Wv, device).view(-1, 3)
+        coords = _dense_coords_for_inr(Dv, Hv, Wv, device).view(-1, 3)
         v = self.grid_inr(coords).view(Dv, Hv, Wv, 1)
         v_min = self.grid_inr.min().to(v.dtype)
         v_max = self.grid_inr.max().to(v.dtype)
@@ -186,7 +239,11 @@ class VolumeSemanticSearcher:
     @torch.no_grad()
     def encode_text(self, phrase: str) -> torch.Tensor:
         """512‑D CLIP text embedding (normalized)."""
-        z = self.clipseg.compute_conditional(phrase)  # provided by CLIPSeg base
+        import open_clip
+        # Tokenize and encode text
+        text = open_clip.tokenize([phrase]).to(device)
+        z = self.clip_model.encode_text(text)  # [1, 512]
+        z = z.squeeze(0)  # [512]
         return _normalize(z.to(device=device, dtype=torch.float32))
 
     @torch.no_grad()
@@ -220,7 +277,6 @@ class VolumeSemanticSearcher:
         """Build similarity grids for each hierarchy level and cache the selection."""
         Dv, Hv, Wv = self._Dv, self._Hv, self._Wv
         mode = (hierarchy_mode or self.hierarchy_mode or "auto").lower()
-        use_canon = self.use_canonical_negatives if use_canonical is None else use_canonical
 
         # Reset cached similarity to release memory from previous queries.
         self._S = None
@@ -229,10 +285,6 @@ class VolumeSemanticSearcher:
 
         # Normalize query embedding
         z_text = _normalize(z_text).to(device=device, dtype=torch.float32)
-        canon = []
-        if use_canon:
-            canon_phrases = ["object", "things", "stuff", "texture"]
-            canon = [self.encode_text(p).to(device=device, dtype=torch.float32) for p in canon_phrases]
 
         x_coords = torch.linspace(-1, 1, Wv, device=device, dtype=torch.float32)
         y_coords = torch.linspace(-1, 1, Hv, device=device, dtype=torch.float32)
@@ -272,8 +324,6 @@ class VolumeSemanticSearcher:
 
             def _rel(x: torch.Tensor) -> torch.Tensor:
                 flat = x.view(-1, d_feat)
-                if use_canon:
-                    return stage2.relevancy_score(flat, z_text, canon).view(-1, Hv, Wv)
                 scores = flat @ z_text.view(-1, 1)
                 return scores.view(-1, Hv, Wv)
 
@@ -302,7 +352,6 @@ class VolumeSemanticSearcher:
 
         self._S_levels = {k: v.contiguous() for k, v in S_levels.items()}
         self.hierarchy_mode = mode
-        self.use_canonical_negatives = use_canon
         self._S, selected = self._resolve_hierarchy_map(mode)
         self._selected_level = selected
 
@@ -313,6 +362,14 @@ class VolumeSemanticSearcher:
         self._argmax_norm = torch.stack([x_coords[w], y_coords[h], z_coords[d]])
 
     def _resolve_hierarchy_map(self, mode: str) -> Tuple[torch.Tensor, str]:
+        """
+        Resolve which hierarchy level to use based on the mode.
+
+        In 'auto' mode, selects the level with the highest maximum activation,
+        matching the logic from activate_stream in eval/evaluate_iou_loc.py:
+        - For each semantic level (s, p, w), find the highest response (max value)
+        - Select the level that had the highest maximum score
+        """
         if not self._S_levels:
             raise RuntimeError("Similarity grid has not been built yet.")
         mode_l = (mode or "auto").lower()
@@ -337,23 +394,40 @@ class VolumeSemanticSearcher:
             combined = (self._S_levels["s"] + self._S_levels["p"] + self._S_levels["w"]) / 3.0
             return combined.contiguous(), "sum"
         if mode_l == "auto":
-            scores = {}
-            for key, volume in self._S_levels.items():
-                flat = volume.view(-1)
-                if flat.numel() == 0:
-                    scores[key] = float("-inf")
+            # Find the maximum activation value within each of the three relevance maps
+            score_lvl = torch.zeros((3,), device=device)
+            level_keys = ['s', 'p', 'w']
+
+            for i, key in enumerate(level_keys):
+                volume = self._S_levels[key]
+                if volume.numel() == 0:
+                    score_lvl[i] = float("-inf")
                 else:
-                    topk = max(1, int(flat.numel() * 0.01))
-                    scores[key] = float(torch.topk(flat, topk).values.mean().item())
-            best_key = max(scores.keys(), key=lambda k: scores[k])
+                    # Find the highest response (max value) in the relevance map for that level
+                    score_lvl[i] = volume.max()
+
+            # Select the level that had the highest maximum score
+            chosen_idx = torch.argmax(score_lvl).item()
+            best_key = level_keys[chosen_idx]
+
+            # Print which mask head was chosen
+            level_names = {'s': 'subpart', 'p': 'part', 'w': 'whole'}
+            print(f"[viewer] Selected mask head: {level_names[best_key]} (max activation: {score_lvl[chosen_idx]:.4f})")
+            print(f"  Activation scores - subpart: {score_lvl[0]:.4f}, part: {score_lvl[1]:.4f}, whole: {score_lvl[2]:.4f}")
+
             return self._S_levels[best_key], best_key
         raise ValueError(f"Unknown hierarchy mode '{mode}'.")
 
     def set_hierarchy_mode(self, mode: str) -> None:
+        """Set the hierarchy mode and re-resolve the similarity map if already computed."""
         self.hierarchy_mode = mode
         if self._S_levels:
             self._S, selected = self._resolve_hierarchy_map(mode)
             self._selected_level = selected
+            if mode.lower() not in ["auto"]:  # auto mode already prints
+                level_names = {'s': 'subpart', 'p': 'part', 'w': 'whole'}
+                display_name = level_names.get(selected, selected)
+                print(f"[viewer] Hierarchy mode changed to '{mode}', using {display_name} level")
 
     def save_similarity_volume(self, path: str, level: Optional[str] = None) -> None:
         if not self._S_levels and self._S is None:
@@ -453,7 +527,7 @@ class Orbit:
 
 def _default_orbit(searcher: VolumeSemanticSearcher) -> Orbit:
     D, H, W = searcher._Dv, searcher._Hv, searcher._Wv
-    dist = math.sqrt(D * D + H * H + W * W) * 1.4
+    dist = math.sqrt(D * D + H * H + W * W) * 0.75
     center = (W / 2.0, H / 2.0, D / 2.0)
     return Orbit(azi_deg=20.0, polar_deg=80.0, dist=dist, center=center)
 
@@ -798,17 +872,20 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Stage‑2 Semantic Viewer (from scratch)")
     p.add_argument("--stage1", default=STAGE1_PATH_DEFAULT, help="Path to Stage‑1 INR checkpoint")
     p.add_argument("--head", default=STAGE2_HEAD_DEFAULT, help="Path to Stage‑2 semantic head")
-    p.add_argument("--weights", default=CLIPSEG_WEIGHTS_DEFAULT, help="Path to CLIPSeg weights (rd64‑uni.pth)")
     p.add_argument("--tf", default=TRANSFER_FUNCTION_DEFAULT, help="ParaView transfer function JSON")
     p.add_argument("--res", type=int, default=512, help="Render resolution (square)")
-    p.add_argument("--threshold", type=float, default=0.90, help="Visibility threshold in [0,1]")
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.30,
+        help="Similarity threshold tau applied to raw scores (typ. 0.25-0.40)",
+    )
     p.add_argument("--agg", type=int, default=0, help="Local feature aggregation radius (voxels)")
     p.add_argument("--blob", type=float, default=0.0, help="Optional Gaussian blob radius around argmax (voxels)")
     p.add_argument("--phrase", type=str, default="", help="Text phrase to search for (CLI mode)")
     p.add_argument("--save", type=str, default="viewer_out.png", help="Path to save rendered image (CLI mode)")
     p.add_argument("--cli", action="store_true", help="Force CLI mode (skip GUI)")
-    p.add_argument("--hierarchy", type=str, default="auto", choices=["auto", "max", "subpart", "part", "whole", "sum"], help="Hierarchy mode for similarity selection")
-    p.add_argument("--no-canon", action="store_true", help="Disable canonical negatives and use raw cosine scores")
+    p.add_argument("--hierarchy", type=str, default="part", choices=["auto", "max", "subpart", "part", "whole", "sum"], help="Hierarchy mode for similarity selection")
     p.add_argument("--save-sim", type=str, default=None, help="Optional path to save the similarity volume (.npz)")
     p.add_argument("--save-sim-level", type=str, default="selected", choices=["selected", "subpart", "part", "whole", "max", "sum"], help="Hierarchy level to save when using --save-sim")
     p.add_argument("--print-level-stats", action="store_true", help="Print per-level summary statistics after building the similarity grid")
@@ -817,11 +894,9 @@ def main(argv=None) -> int:
     searcher = VolumeSemanticSearcher(
         stage1_path=args.stage1,
         stage2_head_path=args.head,
-        clipseg_weights=args.weights,
         transfer_fn_path=args.tf,
         default_res_hw=(args.res, args.res),
     )
-    searcher.use_canonical_negatives = not args.no_canon
     searcher.set_hierarchy_mode(args.hierarchy)
 
     # Try GUI by default unless --cli is specified
