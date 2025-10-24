@@ -7,4 +7,3 @@ keys.py
 *.png
 .neptune
 *.pt
-*.pth

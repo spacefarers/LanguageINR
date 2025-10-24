@@ -56,7 +56,7 @@ def main(mode="stage2"):
         print("Stage 1 model frozen for Stage 2 training")
 
         # Training configuration
-        num_steps = 500
+        num_steps = 250
         image_hw = (128, 128)
         hidden_dim = 256
         n_hidden = 3
@@ -93,7 +93,7 @@ def main(mode="stage2"):
         # Build SAM2 generator
         print("\nBuilding SAM2 generator...")
         sam_generator = stage2.build_sam2_generator(
-            model_size="large",
+            model_size="tiny",
             points_per_side=32,
             points_per_batch=64,
             pred_iou_thresh=0.7,

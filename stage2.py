@@ -55,12 +55,8 @@ def generate_random_render(
     X, Y, Z = VOLUME_DIMS
     D, H, W = Z, Y, X
 
-    # 1. Generate random camera using render.sample_random_perspective()
-    camera = render.sample_random_perspective(
-        grid_inr=grid_inr,
-        polar_min_deg=20.0,
-        polar_max_deg=160.0,
-    )
+    # 1. Generate random camera from x-axis ring (fixed azimuth, random polar angle)
+    camera = render.sample_random_perspective(grid_inr=grid_inr)
     camera.dist = camera.dist * 0.75
 
     # 2. Sample the INR to get a dense scalar volume
@@ -479,7 +475,7 @@ def train_semantic_layer(
     image_hw: Tuple[int, int] = (128, 128),
     loss_type: str = "cosine",
     batch_size: int = 1024,  # Reduced from 8192 to save VRAM
-    save_debug_every: int = 1,  # Save debug images every N steps
+    save_debug_every: int = 10,  # Save debug images every N steps
     clip_prob: float = 0.5,
 ) -> Dict:
     """

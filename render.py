@@ -23,12 +23,17 @@ def _infer_bounds_and_center(grid_inr: "nn.Module"):
     return (D,H,W), ((W-1)*0.5,(H-1)*0.5,(D-1)*0.5)
 
 def sample_random_perspective(grid_inr: "nn.Module", polar_min_deg=20.0, polar_max_deg=160.0, center=None, center_offset=(0.0,0.0,0.0)) -> "Camera":
-    (Dv,Hv,Wv), c0 = _infer_bounds_and_center(grid_inr); cx,cy,cz = center or c0; ox,oy,oz = center_offset; cx+=ox; cy+=oy; cz+=oz
-    azi_deg = random.uniform(0.0,360.0)
-    u=random.random(); cos_min=math.cos(math.radians(polar_max_deg)); cos_max=math.cos(math.radians(polar_min_deg))
-    polar_deg = math.degrees(math.acos(cos_min+(cos_max-cos_min)*u))
-    dist = np.sqrt(Dv**2+Hv**2+Wv**2)
-    return Camera(azi_deg=azi_deg, polar_deg=polar_deg, center=(cx,cy,cz), dist=dist)
+    """Sample camera rotating around z-axis: random azimuth, fixed polar angle (horizontal orbit)."""
+    (Dv,Hv,Wv), c0 = _infer_bounds_and_center(grid_inr)
+    cx, cy, cz = center or c0
+    ox, oy, oz = center_offset
+    cx += ox; cy += oy; cz += oz
+
+    azi_deg = random.uniform(0.0, 360.0)  # Random: walk around volume (rotate around z-axis)
+    polar_deg = 90.0  # Fixed: horizontal plane at volume center height
+    dist = np.sqrt(Dv**2 + Hv**2 + Wv**2)
+
+    return Camera(azi_deg=azi_deg, polar_deg=polar_deg, center=(cx, cy, cz), dist=dist)
 
 class ParaViewTransferFunction:
     """
