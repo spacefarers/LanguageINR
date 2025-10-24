@@ -187,10 +187,11 @@ def build_sam2_generator(
     return mask_generator
 
 
+sam_generator = build_sam2_generator(model_size="tiny")
+
 def segment_image_with_sam2(
     image: torch.Tensor,
     sam_generator: "SAM2AutomaticMaskGenerator" = None,
-    model_size: str = "small",
 ) -> List[Dict]:
     """
     Segment an image using SAM2AutomaticMaskGenerator.
@@ -213,10 +214,6 @@ def segment_image_with_sam2(
         image_np = (image.cpu().numpy() * 255).astype(np.uint8)
     else:
         image_np = (image * 255).astype(np.uint8)
-
-    # Create generator if not provided
-    if sam_generator is None:
-        sam_generator = build_sam2_generator(model_size=model_size)
 
     # Generate masks
     masks = sam_generator.generate(image_np)
@@ -640,16 +637,10 @@ def train_semantic_layer(
             pred_norm = F.normalize(pred_masked, dim=-1)
             target_norm_feat = F.normalize(target_masked, dim=-1)
 
-            if loss_type == "cosine":
-                # Cosine similarity loss: higher similarity = lower loss
-                # range: [0, 2], min at cos_sim=1 (perfect match)
-                similarity = (pred_norm * target_norm_feat).sum(dim=-1)  # [N]
-                loss = (1.0 - similarity).mean()
-            elif loss_type == "l2":
-                # L2 distance on normalized vectors
-                loss = ((pred_norm - target_norm_feat) ** 2).mean()
-            else:
-                raise ValueError(f"Unknown loss_type: {loss_type}")
+            # Cosine similarity loss: higher similarity = lower loss
+            # range: [0, 2], min at cos_sim=1 (perfect match)
+            similarity = (pred_norm * target_norm_feat).sum(dim=-1)  # [N]
+            loss = (1.0 - similarity).mean()
 
             return loss
 
@@ -853,8 +844,6 @@ def render_semantics(
         volume_dims=(D_vol, H_vol, W_vol),
         output_channels=512
     )
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()  # Free memory before next render
 
     feat_p_img = render.render_with_nerfacc(
         camera=camera,
@@ -865,8 +854,6 @@ def render_semantics(
         volume_dims=(D_vol, H_vol, W_vol),
         output_channels=512
     )
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()  # Free memory before next render
 
     feat_w_img = render.render_with_nerfacc(
         camera=camera,
@@ -877,8 +864,6 @@ def render_semantics(
         volume_dims=(D_vol, H_vol, W_vol),
         output_channels=512
     )
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()  # Free memory after all renders
 
     return feat_s_img, feat_p_img, feat_w_img
 
