@@ -66,7 +66,7 @@ import torch.nn.functional as F
 
 # Project imports
 from config import device, opt, dtype, TRANSFER_FUNCTION_PATH, VOLUME_DIMS  # type: ignore
-from model import NGP_TCNN, SemanticLayer  # type: ignore
+from model import NGP_TCNN, SemanticLayer, SceneAutoencoder  # type: ignore
 from render import Camera, render_with_nerfacc, ParaViewTransferFunction  # type: ignore
 import stage2  # type: ignore
 
@@ -77,7 +77,9 @@ import stage2  # type: ignore
 
 STAGE1_PATH_DEFAULT    = "./models/stage1_ngp_tcnn.pth"
 STAGE2_HEAD_DEFAULT    = "./models/stage2_semantic_head.pth"
+STAGE2_AUTOENCODER_DEFAULT = "./models/stage2_autoencoder.pth"
 TRANSFER_FUNCTION_DEFAULT = TRANSFER_FUNCTION_PATH  # Imported from config.py
+CANONICAL_NEGATIVE_PHRASES = ["object", "things", "stuff", "texture"]
 
 
 # ------------------------------
@@ -144,8 +146,12 @@ def relevancy_score(
     neg_sim = features @ neg_stack.T  # [N, K]
     neg_max = neg_sim.max(dim=-1).values  # [N]
 
-    # Contrast: emphasize query over negatives
-    return (pos_sim - neg_max).clamp(min=0.0)
+    # Contrast: emphasize query over negatives while preserving dynamic range.
+    contrasted = (pos_sim - neg_max).clamp(min=0.0)
+    if contrasted.max().item() <= 0.0:
+        # Fallback: if nothing beats the canonical negatives, return the raw similarity.
+        return pos_sim
+    return contrasted
 
 
 # ------------------------------
@@ -165,6 +171,7 @@ class VolumeSemanticSearcher:
         self,
         stage1_path: str = STAGE1_PATH_DEFAULT,
         stage2_head_path: str = STAGE2_HEAD_DEFAULT,
+        autoencoder_path: str = STAGE2_AUTOENCODER_DEFAULT,
         transfer_fn_path: str = TRANSFER_FUNCTION_DEFAULT,
         default_res_hw: Tuple[int, int] = (512, 512),
         default_samples: int = 16,
@@ -193,6 +200,7 @@ class VolumeSemanticSearcher:
         # ---- Stage‑2 semantic head (latent) ----
         _ensure(os.path.exists(stage2_head_path), f"Missing Stage‑2 head at {stage2_head_path}")
         head_state = torch.load(stage2_head_path, map_location="cpu")
+
         def _infer_latent_dim(state_dict: Dict[str, torch.Tensor]) -> int:
             # Try to find head weights (head_s, head_p, or head_w)
             for head_key in ["head_s.weight", "head_p.weight", "head_w.weight"]:
@@ -200,10 +208,41 @@ class VolumeSemanticSearcher:
                     # Output dimension is the first dimension of the weight matrix
                     return int(state_dict[head_key].shape[0])
             _ensure(False, "Unable to infer latent dimension from Stage-2 head state dict")
+
+        def _infer_trunk_params(state_dict: Dict[str, torch.Tensor]) -> Tuple[int, int]:
+            # Infer hidden_dim and n_hidden from trunk layer weights
+            # Trunk has structure: trunk.0.weight, trunk.0.bias, trunk.2.weight, trunk.2.bias, ...
+            # (with ReLU activation layers at odd indices)
+            hidden_dim = None
+            n_hidden = 0
+
+            for key in sorted(state_dict.keys()):
+                if key.startswith("trunk.") and key.endswith(".weight"):
+                    weight = state_dict[key]
+                    if hidden_dim is None:
+                        # First trunk layer: output dim is hidden_dim
+                        hidden_dim = int(weight.shape[0])
+                    n_hidden += 1
+
+            if hidden_dim is None or n_hidden == 0:
+                # Fallback to defaults if inference fails
+                return 256, 3
+
+            return hidden_dim, n_hidden
+
         self.latent_dim = _infer_latent_dim(head_state)
-        self.semantic = SemanticLayer(hidden_dim=256, n_hidden=3, latent_dim=self.latent_dim).to(device)
+        hidden_dim, n_hidden = _infer_trunk_params(head_state)
+        self.semantic = SemanticLayer(hidden_dim=hidden_dim, n_hidden=n_hidden, latent_dim=self.latent_dim).to(device)
         self.semantic.load_state_dict(head_state)
         self.semantic.eval()
+
+        # ---- Load Autoencoder (if available) ----
+        self.autoencoder = None
+        if os.path.exists(autoencoder_path):
+            self.autoencoder = SceneAutoencoder(clip_dim=512, latent_dim=self.latent_dim).to(device)
+            self.autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
+            self.autoencoder.eval()
+        # If autoencoder is not available, we'll work directly with 512-D features
 
         # ---- Transfer function ----
         self.transfer_fn = ParaViewTransferFunction(transfer_fn_path)
@@ -219,6 +258,27 @@ class VolumeSemanticSearcher:
         self._S_levels: Dict[str, torch.Tensor] = {}
         self.hierarchy_mode: str = "part"
         self._selected_level: Optional[str] = None
+        self._default_use_canonical: bool = True
+        self._canonical_embeddings: Optional[List[torch.Tensor]] = None
+
+    def set_canonical_negatives_enabled(self, enabled: bool) -> None:
+        """Toggle the use of canonical negatives for contrastive scoring."""
+        self._default_use_canonical = bool(enabled)
+
+    def canonical_negatives_enabled(self) -> bool:
+        return self._default_use_canonical
+
+    def _get_canonical_embeddings(self) -> List[torch.Tensor]:
+        if self._canonical_embeddings is None:
+            embeddings: List[torch.Tensor] = []
+            for phrase in CANONICAL_NEGATIVE_PHRASES:
+                try:
+                    embeddings.append(self.encode_text(phrase).detach())
+                except Exception:
+                    # Skip phrases that fail to encode for any reason.
+                    continue
+            self._canonical_embeddings = embeddings
+        return self._canonical_embeddings
 
     def _ensure_scalar_field(self) -> torch.Tensor:
         """Cache the normalized scalar volume so downstream passes avoid re-sampling the INR."""
@@ -228,8 +288,8 @@ class VolumeSemanticSearcher:
         Dv, Hv, Wv = self._Dv, self._Hv, self._Wv
         coords = _dense_coords_for_inr(Dv, Hv, Wv, device).view(-1, 3)
         v = self.grid_inr(coords).view(Dv, Hv, Wv, 1)
-        v_min = self.grid_inr.min().to(v.dtype)
-        v_max = self.grid_inr.max().to(v.dtype)
+        v_min = v.amin()
+        v_max = v.amax()
         v_norm = ((v - v_min) / (v_max - v_min + 1e-8)).clamp(0, 1).contiguous()
         self._v_norm = v_norm
         return self._v_norm
@@ -269,7 +329,7 @@ class VolumeSemanticSearcher:
     def build_similarity_grid(
         self,
         z_text: torch.Tensor,
-        aggregation_radius: int = 3,
+        aggregation_radius: int = 0,
         *,
         hierarchy_mode: Optional[str] = None,
         use_canonical: Optional[bool] = None,
@@ -310,6 +370,8 @@ class VolumeSemanticSearcher:
         xx_base = xx_base.unsqueeze(0)
 
         d_feat = self.latent_dim
+        use_canon = self._default_use_canonical if use_canonical is None else bool(use_canonical)
+        canonical_vectors = self._get_canonical_embeddings() if use_canon else []
 
         for start in range(0, Dv, z_per_chunk):
             end = min(start + z_per_chunk, Dv)
@@ -322,18 +384,20 @@ class VolumeSemanticSearcher:
             v_chunk = v_norm_full[start:end].reshape(-1, 1)
             inputs = torch.cat([coords, v_chunk], dim=-1)
 
-            def _rel(x: torch.Tensor) -> torch.Tensor:
-                flat = x.view(-1, d_feat)
-                scores = flat @ z_text.view(-1, 1)
-                return scores.view(-1, Hv, Wv)
-
             # Pass inputs through the trunk first to get 256-D features, then project via heads
             trunk_feats = self.semantic.trunk(inputs)  # [N, 256]
             for key, head in (("s", self.semantic.head_s), ("p", self.semantic.head_p), ("w", self.semantic.head_w)):
-                feats = head(trunk_feats)  # [N, d_feat]
-                feats = _normalize(feats, eps=1e-6).to(dtype=torch.float32)
-                feats = feats.view(depth, Hv, Wv, d_feat)
-                S_levels[key][start:end] = _rel(feats)
+                feats = head(trunk_feats).to(dtype=torch.float32)  # [N, d_feat]
+                flat = feats.view(-1, d_feat)
+
+                if self.autoencoder is not None:
+                    decoded = self.autoencoder.decoder(flat)
+                    flat_512 = _normalize(decoded, eps=1e-6).to(dtype=torch.float32)
+                else:
+                    flat_512 = _normalize(flat, eps=1e-6).to(dtype=torch.float32)
+
+                scores_flat = relevancy_score(flat_512, z_text, canonical_vectors)
+                S_levels[key][start:end] = scores_flat.view(depth, Hv, Wv)
                 del feats
             del trunk_feats
 
@@ -743,8 +807,8 @@ def _try_launch_gui(args, searcher: VolumeSemanticSearcher) -> int:
             self.render_once()
 
         def _nudge_orbit(self, dx_deg: float, dy_deg: float):
-            self.orbit.azi_deg = (self.orbit.azi_deg + dx_deg) % 360.0
-            self.orbit.polar_deg = _clamp(self.orbit.polar_deg + dy_deg, 5.0, 175.0)
+            self.orbit.azi_deg = (self.orbit.azi_deg - dx_deg) % 360.0
+            self.orbit.polar_deg = _clamp(self.orbit.polar_deg - dy_deg, 5.0, 175.0)
             self.cam = _build_camera(self.orbit)
 
         def _nudge_zoom(self, delta: float):
@@ -872,6 +936,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Stage‑2 Semantic Viewer (from scratch)")
     p.add_argument("--stage1", default=STAGE1_PATH_DEFAULT, help="Path to Stage‑1 INR checkpoint")
     p.add_argument("--head", default=STAGE2_HEAD_DEFAULT, help="Path to Stage‑2 semantic head")
+    p.add_argument("--ae", default=STAGE2_AUTOENCODER_DEFAULT, help="Path to Stage‑2 autoencoder")
     p.add_argument("--tf", default=TRANSFER_FUNCTION_DEFAULT, help="ParaView transfer function JSON")
     p.add_argument("--res", type=int, default=512, help="Render resolution (square)")
     p.add_argument(
@@ -882,6 +947,7 @@ def main(argv=None) -> int:
     )
     p.add_argument("--agg", type=int, default=0, help="Local feature aggregation radius (voxels)")
     p.add_argument("--blob", type=float, default=0.0, help="Optional Gaussian blob radius around argmax (voxels)")
+    p.add_argument("--no-canon", action="store_true", help="Disable canonical negative contrast when scoring")
     p.add_argument("--phrase", type=str, default="", help="Text phrase to search for (CLI mode)")
     p.add_argument("--save", type=str, default="viewer_out.png", help="Path to save rendered image (CLI mode)")
     p.add_argument("--cli", action="store_true", help="Force CLI mode (skip GUI)")
@@ -894,9 +960,11 @@ def main(argv=None) -> int:
     searcher = VolumeSemanticSearcher(
         stage1_path=args.stage1,
         stage2_head_path=args.head,
+        autoencoder_path=args.ae,
         transfer_fn_path=args.tf,
         default_res_hw=(args.res, args.res),
     )
+    searcher.set_canonical_negatives_enabled(not args.no_canon)
     searcher.set_hierarchy_mode(args.hierarchy)
 
     # Try GUI by default unless --cli is specified

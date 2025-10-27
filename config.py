@@ -8,7 +8,7 @@ import json
 
 
 machine = platform.node()
-device = torch.device('cuda')
+device = torch.device('cuda:1')
 batch_size = 1
 
 # VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/lobster_301x324x56_uint8_normalized_float32.raw"
@@ -17,11 +17,11 @@ batch_size = 1
 
 VOLUME_PATH = "data/bonsai_256x256x256_uint8_float32_normalized.raw"
 VOLUME_DIMS = [256, 256, 256]
-TRANSFER_FUNCTION_PATH = "./paraview_tf/bonsai.json"
+TRANSFER_FUNCTION_PATH = "./paraview_tf/bonsai2.json"
 
-# VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/chameleon_256x256x270_normalized_float32.raw"
+# VOLUME_PATH = "data/chameleon_256x256x270_float32_normalized.raw"
 # VOLUME_DIMS = [256, 256, 270]
-# TRANSFER_FUNCTION_PATH = "./paraview_tf/bonsai.json"
+# TRANSFER_FUNCTION_PATH = "./paraview_tf/chameleon.json"
 
 np_dtype = np.float32
 dtype = torch.float32
@@ -59,3 +59,39 @@ opt = {
     'data_max': 1,
     'full_shape': VOLUME_DIMS,
 }
+
+
+# Neptune logging utilities
+neptune_run = None  # Global Neptune run instance
+
+def init_neptune_run(name: str, tags: list = None):
+    """
+    Initialize a Neptune run for experiment tracking.
+
+    Args:
+        name: Name of the run (e.g., "Stage2-Semantic-Training")
+        tags: List of tags for the run (e.g., ["stage2", "semantic"])
+
+    Returns:
+        neptune.Run object for logging
+    """
+    global neptune_run
+    from keys import NEPTUNE_API_TOKEN, PROJECT
+
+    if tags is None:
+        tags = []
+
+    neptune_run = neptune.init_run(
+        project=PROJECT,
+        api_token=NEPTUNE_API_TOKEN,
+        name=name,
+        tags=tags,
+    )
+    return neptune_run
+
+def stop_neptune_run():
+    """Stop the global Neptune run if it exists."""
+    global neptune_run
+    if neptune_run is not None:
+        neptune_run.stop()
+        neptune_run = None

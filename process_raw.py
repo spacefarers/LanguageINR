@@ -19,10 +19,18 @@ _DTYPE_ALIASES = {
     "int32": np.int32,
 }
 
-def load_raw(filepath, shape, dtype=np.uint8):
-    """Load raw binary file as numpy array"""
-    data = np.fromfile(filepath, dtype=dtype,format="<f")
-    return data.reshape(shape)
+def readDat(vol_path, dim=None, dtype=np.uint8):
+    """Load raw binary file as numpy array with transpose"""
+    if dtype == np.float32:
+        Vol = np.fromfile(vol_path, dtype='<f')
+    else:
+        Vol = np.fromfile(vol_path, dtype=dtype)
+
+    if dim is not None:
+        # Reshape with ZYX order and transpose to XYZ
+        Vol = Vol.reshape(dim[2], dim[1], dim[0]).transpose(2, 1, 0)
+
+    return Vol
 
 def downsample_volume(volume, factor):
     """
@@ -83,9 +91,9 @@ def normalize_volume(volume):
 
     return normalized
 
-def save_raw(filepath, data):
-    """Save numpy array as raw binary file"""
-    data.tofile(filepath)
+def saveDat(vol, save_path):
+    """Save numpy array as raw binary file with Fortran order flattening"""
+    vol.flatten('F').tofile(save_path)
 
 def infer_dtype_from_name(path):
     """Infer dtype from filename"""
@@ -134,7 +142,7 @@ def main():
         return 1
 
     print(f"Loading {args.input} with shape {args.shape} and dtype {dtype_name}...")
-    volume = load_raw(args.input, tuple(args.shape), dtype)
+    volume = readDat(args.input, dim=tuple(args.shape), dtype=dtype)
     print(f"Original shape: {volume.shape}, size: {volume.nbytes / 1024**2:.2f} MB")
 
     # Downsample if requested
@@ -151,7 +159,7 @@ def main():
 
     print(f"Final shape: {volume.shape}, size: {volume.nbytes / 1024**2:.2f} MB")
     print(f"Saving to {args.output}...")
-    save_raw(args.output, volume)
+    saveDat(volume, args.output)
 
     print("Done!")
     return 0

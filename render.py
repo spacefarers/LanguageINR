@@ -23,14 +23,14 @@ def _infer_bounds_and_center(grid_inr: "nn.Module"):
     return (D,H,W), ((W-1)*0.5,(H-1)*0.5,(D-1)*0.5)
 
 def sample_random_perspective(grid_inr: "nn.Module", polar_min_deg=20.0, polar_max_deg=160.0, center=None, center_offset=(0.0,0.0,0.0)) -> "Camera":
-    """Sample camera rotating around z-axis: random azimuth, fixed polar angle (horizontal orbit)."""
+    """Sample camera rotating around z-axis: random azimuth, random polar angle for 3D coverage."""
     (Dv,Hv,Wv), c0 = _infer_bounds_and_center(grid_inr)
     cx, cy, cz = center or c0
     ox, oy, oz = center_offset
     cx += ox; cy += oy; cz += oz
 
     azi_deg = random.uniform(0.0, 360.0)  # Random: walk around volume (rotate around z-axis)
-    polar_deg = 90.0  # Fixed: horizontal plane at volume center height
+    polar_deg = random.uniform(polar_min_deg, polar_max_deg)  # Random: varied elevation for better 3D coverage
     dist = np.sqrt(Dv**2 + Hv**2 + Wv**2)
 
     return Camera(azi_deg=azi_deg, polar_deg=polar_deg, center=(cx, cy, cz), dist=dist)
@@ -101,8 +101,7 @@ class ParaViewTransferFunction:
             return rgb_tensor, alpha_tensor
         else:
             # Return combined RGBA tensor for numpy
-            rgba = np.stack([r, g, b, opacity], axis=-1)
-            rgba = rgba.reshape(volume_np.shape + (4,))
+            rgba = np.stack([r, g, b, opacity], axis=-1)  # [D, H, W, 4]
             return torch.tensor(rgba, device=device, dtype=dtype)
 
 
@@ -179,7 +178,8 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
                         batch_size: int = 8192,
                         feature_fn = None,
                         volume_dims = None,
-                        output_channels: int = 3):
+                        output_channels: int = 3,
+                        render_step_size: float = 2.0):
     """Render an RGBA volume or custom features using NerfAcc.
 
     Args:
@@ -196,6 +196,8 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
             - sigmas: [N] densities
         volume_dims: Tuple of (depth, height, width) if using feature_fn
         output_channels: Number of output channels (3 for RGB, 512 for semantic)
+        render_step_size: Step size for ray marching (default 2.0). Should be consistent
+            between RGB and semantic rendering to avoid supervision mismatch.
     """
 
     if rgba_volume is not None:
@@ -269,7 +271,9 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
             sampled = F.grid_sample(vol, grid, mode='bilinear', align_corners=True)  # [1,4,1,1,NR]
             rgba = sampled.view(4,-1).T                                            # [NR,4]
             rgbs, alphas = rgba[:,:3], rgba[:,3].clamp(0, 0.999)
-            sigmas = -torch.log1p(-alphas)                                        # density from alpha
+            # Convert alpha to sigma accounting for step length
+            # This ensures alpha_i ≈ 1 - exp(-sigma * Δt_i) is consistent
+            sigmas = -torch.log1p(-alphas) / render_step_size
             return rgbs, sigmas
 
     max_dist = 2.0 * float(torch.linalg.norm(aabb[3:] - aabb[:3]))
@@ -286,17 +290,12 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
         batch_idx = batch_start // batch_size
 
         t0 = time.time()
-        # Use larger render_step_size to reduce sample count and prevent CUDA kernel hang
-        # For a 256^3 volume with diagonal~442 and max_dist~884:
-        #   step_size=4.0 -> ~220 samples/ray (recommended for semantic features)
-        #   step_size=2.0 -> ~440 samples/ray (high quality RGB)
-        #   step_size=8.0 -> ~110 samples/ray (faster, lower quality)
-        step_size = 4.0 if feature_fn is not None else 2.0
+        # Use provided render_step_size for consistent sampling between RGB and semantic paths
         batch_ray_indices, batch_t_starts, batch_t_ends = estimator.sampling(
             batch_origins, batch_dirs,
             near_plane=0.0,
             far_plane=max_dist,
-            render_step_size=step_size,
+            render_step_size=render_step_size,
         )
         total_time['sampling'] += time.time() - t0
 
@@ -371,7 +370,15 @@ def generate_volume_render_png(volume: np.ndarray,
                                hw=(1024,1024),
                                spp=1000,
                                batch_size: int = 8192):
-    volume = np.asarray(volume)
+    if isinstance(volume, torch.Tensor):
+        volume = volume.cpu().numpy()
+    else:
+        volume = np.asarray(volume)
+
+    # Squeeze out batch dimensions if present [1, 1, D, H, W] -> [D, H, W]
+    while volume.ndim > 3:
+        volume = np.squeeze(volume, axis=0)
+
     volume_dhw = _volume_xyz_to_dhw(volume)
     transfer_fn = ParaViewTransferFunction(tf_filename)
     rgba_volume = transfer_fn(volume_dhw)

@@ -4,6 +4,51 @@ from math import exp, log
 import tinycudann as tcnn
 
 
+class SceneAutoencoder(nn.Module):
+    """
+    Autoencoder to learn a scene-specific latent space for CLIP features.
+    Maps 512-D CLIP features to a low-dimensional space (e.g., 8-D).
+    """
+    def __init__(self, clip_dim: int = 512, latent_dim: int = 3, hidden_dim: int = 128):
+        """
+        Args:
+            clip_dim: Input/output dimension (512 for CLIP ViT-B/32)
+            latent_dim: Bottleneck dimension (e.g., 8)
+            hidden_dim: Intermediate dimension
+        """
+        super().__init__()
+        self.clip_dim = clip_dim
+        self.latent_dim = latent_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(clip_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, clip_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through the autoencoder.
+
+        Args:
+            x: [N, 512] tensor of CLIP features
+
+        Returns:
+            Tuple of (reconstructed, latent):
+            - reconstructed: [N, 512] reconstructed CLIP features
+            - latent: [N, 8] latent features
+        """
+        latent = self.encoder(x)
+        reconstructed = self.decoder(latent)
+        return reconstructed, latent
+
+
 class SemanticLayer(nn.Module):
     """
     Semantic layer that maps voxel features to CLIP embedding space.
@@ -13,7 +58,7 @@ class SemanticLayer(nn.Module):
     - head_p: Part-level features (512D)
     - head_w: Whole-level features (512D)
 
-    Input: (x, y, z, value) - 4D voxel coordinates and scalar value
+    Input: (x, y, z) - 3D normalized voxel coordinates
     Output: Three 512D feature vectors per voxel
     """
 
@@ -30,9 +75,9 @@ class SemanticLayer(nn.Module):
         self.n_hidden = n_hidden
         self.latent_dim = latent_dim
 
-        # Shared trunk that processes (x, y, z, value)
+        # Shared trunk that processes (x, y, z)
         trunk_layers = []
-        trunk_layers.append(nn.Linear(4, hidden_dim))
+        trunk_layers.append(nn.Linear(3, hidden_dim))
         trunk_layers.append(nn.ReLU(inplace=True))
 
         for _ in range(n_hidden - 1):
@@ -51,11 +96,11 @@ class SemanticLayer(nn.Module):
         Forward pass through semantic layer.
 
         Args:
-            x: [N, 4] tensor of (x, y, z, value)
+            x: [N, 3] tensor of (x, y, z) normalized coordinates
             head: Optional head to compute ('s', 'p', 'w'). If None, computes all three.
 
         Returns:
-            If head is None: Tuple of (feat_s, feat_p, feat_w), each [N, 512]
+            If head is None: Tuple of (feat_s, feat_p, feat_w), each [N, latent_dim]
             If head is specified: Returns only the requested head as (feat, None, None)
                                   or similar pattern based on which head
         """
