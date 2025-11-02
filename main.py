@@ -66,7 +66,6 @@ def main(mode="all"):
 
         try:
             # Training configuration
-            latent_dim = 3
             image_hw = (128, 128)
             lr = 1e-3
             num_epochs = 100
@@ -74,7 +73,6 @@ def main(mode="all"):
 
             print(f"\nConfiguration:")
             print(f"  Image resolution: {image_hw}")
-            print(f"  Latent dim: {latent_dim}")
             print(f"  Learning rate: {lr}")
             print(f"  Epochs: {num_epochs}")
             print(f"  Gather steps: {num_gather_steps}")
@@ -107,7 +105,6 @@ def main(mode="all"):
                 clip_model=clip_model,
                 clip_preprocess=clip_preprocess,
                 transfer_function=transfer_fn,
-                latent_dim=latent_dim,
                 num_gather_steps=num_gather_steps,
                 num_epochs=num_epochs,
                 lr=lr,
@@ -142,17 +139,11 @@ def main(mode="all"):
             # Training configuration
             num_steps = 250
             image_hw = (128, 128)
-            hidden_dim = 256
-            n_hidden = 3
-            latent_dim = 3
-            lr = 1e-4
-            weight_decay = 1e-4
+            lr = 1e-3
 
             print(f"\nConfiguration:")
             print(f"  Steps: {num_steps}")
             print(f"  Image resolution: {image_hw}")
-            print(f"  Network: hidden_dim={hidden_dim}, n_hidden={n_hidden}, latent_dim={latent_dim}")
-            print(f"  Optimizer: lr={lr}, weight_decay={weight_decay}")
 
             # Load transfer function
             transfer_fn = render.ParaViewTransferFunction(tf_filename)
@@ -176,7 +167,7 @@ def main(mode="all"):
 
             # Load the pre-trained Autoencoder
             print("\nLoading pre-trained Autoencoder...")
-            autoencoder = SceneAutoencoder(clip_dim=512, latent_dim=latent_dim).to(device)
+            autoencoder = SceneAutoencoder().to(device)
             autoencoder_path = "./models/stage2_autoencoder.pth"
             if os.path.exists(autoencoder_path):
                 autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
@@ -190,11 +181,7 @@ def main(mode="all"):
 
             # Initialize semantic layer
             print("\nInitializing SemanticLayer...")
-            semantic_layer = SemanticLayer(
-                hidden_dim=hidden_dim,
-                n_hidden=n_hidden,
-                latent_dim=latent_dim
-            ).to(device)
+            semantic_layer = SemanticLayer().to(device)
             num_params = sum(p.numel() for p in semantic_layer.parameters())
             print(f"  Created with {num_params:,} parameters")
 
@@ -202,14 +189,12 @@ def main(mode="all"):
             optimizer = torch.optim.AdamW(
                 semantic_layer.parameters(),
                 lr=lr,
-                weight_decay=weight_decay
             )
 
             # Train semantic layer
             print(f"\nStarting training for {num_steps} steps...\n")
 
             # Use smaller batch size to avoid CUDA errors and VRAM issues
-            batch_size = 512
 
             history = stage2.train_semantic_layer(
                 grid_inr=model,
@@ -222,8 +207,6 @@ def main(mode="all"):
                 autoencoder=autoencoder,
                 num_steps=num_steps,
                 image_hw=image_hw,
-                loss_type="cosine",
-                batch_size=batch_size,
                 neptune_run=run,
             )
 

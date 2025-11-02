@@ -127,7 +127,7 @@ def generate_random_render(
         camera=camera,
         hw=image_hw,
         spp=None,  # Use default sampling
-        batch_size=8192,
+        batch_size=1024,
         render_step_size=render_step_size
     )
 
@@ -135,6 +135,49 @@ def generate_random_render(
     rendered_img = rendered_img.clamp(0, 1).to(device=device, dtype=torch.float32)
 
     return rendered_img, camera
+
+
+def precompute_opacity_volume(
+    grid_inr: "nn.Module",
+    transfer_function: Optional[render.ParaViewTransferFunction],
+) -> torch.Tensor:
+    """
+    Sample the Stage-1 INR once to obtain a dense opacity volume.
+
+    Args:
+        grid_inr: Trained Stage-1 model that returns scalar densities.
+        transfer_function: ParaView transfer function used to map values -> alpha.
+
+    Returns:
+        Tensor of shape [D, H, W] with per-voxel opacity in [0, 0.999].
+    """
+    X, Y, Z = VOLUME_DIMS
+    D, H, W = Z, Y, X
+
+    x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
+    y = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+    z = torch.linspace(-1, 1, D, device=device, dtype=dtype)
+    zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
+    coords = torch.stack([xx, yy, zz], dim=-1).view(-1, 3)
+
+    with torch.no_grad():
+        values = grid_inr(coords).view(D, H, W, 1)
+
+    v_min = values.amin()
+    v_max = values.amax()
+    volume_norm = (values - v_min) / (v_max - v_min + 1e-8)
+    volume_norm = volume_norm.clamp(0, 1)
+
+    if transfer_function is not None:
+        _, alpha = transfer_function(volume_norm)
+    else:
+        alpha = volume_norm.squeeze(-1)
+
+    if alpha.dim() == 4:
+        alpha = alpha.squeeze(-1)
+
+    alpha = alpha.clamp(0, 0.999)
+    return alpha.to(device=device, dtype=dtype).contiguous()
 
 
 # ==============================================================================
@@ -462,20 +505,15 @@ def generate_clip_features_from_masks(
         masks = masks_grouped[level]
 
         if len(masks) == 0:
-            print(f"  [CLIP] No masks for level '{level}'")
             continue
 
         partitions = _filter_and_partition(masks)
         if not partitions:
-            print(f"  [CLIP] No valid partitions for level '{level}' after deduplication")
             continue
 
-        print(f"  [CLIP] Processing {len(partitions)} disjoint regions at level '{level}'...", flush=True)
 
         # Process each disjoint region at this level
         for idx, seg in enumerate(partitions):
-            if idx % 5 == 0:
-                print(f"    Processing region {idx+1}/{len(partitions)}...", flush=True)
             try:
                 y_indices, x_indices = np.where(seg)
                 if len(y_indices) == 0:
@@ -509,8 +547,6 @@ def generate_clip_features_from_masks(
             except Exception as e:
                 print(f"    Warning: Failed to process region {idx} at level '{level}': {e}", flush=True)
                 continue
-
-        print(f"  [CLIP] Completed level '{level}'", flush=True)
 
     return feature_maps['s'], feature_maps['p'], feature_maps['w']
 
@@ -607,7 +643,7 @@ def train_autoencoder(
         }
 
     # --- 2. Train Autoencoder ---
-    autoencoder = SceneAutoencoder(clip_dim=512, latent_dim=latent_dim).to(device)
+    autoencoder = SceneAutoencoder().to(device)
     autoencoder.train()
 
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=lr)
@@ -731,89 +767,30 @@ def train_semantic_layer(
     clip_model,
     clip_preprocess,
     transfer_function: render.ParaViewTransferFunction,
-    autoencoder: "nn.Module" = None,
+    autoencoder: "nn.Module",
     num_steps: int = 100,
     image_hw: Tuple[int, int] = (128, 128),
-    loss_type: str = "cosine",
-    batch_size: int = 1024,  # Reduced from 8192 to save VRAM
+    batch_size: int = 8192,  # Batch size for ray processing (fixed from 1 to prevent fragmentation)
     save_debug_every: int = 10,  # Save debug images every N steps
-    clip_prob: float = 0,
     neptune_run = None,
 ) -> Dict:
-    """
-    Train the semantic layer by comparing rendered semantic features against CLIP features.
-
-    For each training step:
-    1. Generate a random perspective render
-    2. Segment into 3 layers (s, p, w) using SAM2
-    3. Generate ground-truth CLIP embeddings for each hierarchy
-    4. Encode ground-truth features to latent space (if autoencoder provided)
-    5. Render semantic features using the semantic layer
-    6. Compute loss between rendered and CLIP features (in latent space if autoencoder)
-    7. Backprop through semantic layer
-
-    Args:
-        grid_inr: Stage 1 NGP model (frozen)
-        semantic_layer: SemanticLayer to train
-        optimizer: Optimizer for semantic layer (e.g., AdamW)
-        sam_generator: SAM2AutomaticMaskGenerator
-        clip_model: Loaded CLIP model
-        clip_preprocess: CLIP preprocessing function
-        transfer_function: ParaViewTransferFunction
-        autoencoder: Optional SceneAutoencoder to map 512-D features to latent space
-        num_steps: Number of training steps
-        image_hw: Output image resolution (height, width)
-        loss_type: Loss function ("cosine" for cosine similarity, "l1" or "l2" for distance-based)
-        batch_size: Number of rays to process per batch in rendering (default 8192)
-        save_debug_every: Save debug images every N steps to results/stage2/debugviews
-        clip_prob: Probability of applying a random geometric clip to each render
-        neptune_run: Optional Neptune run instance for logging
-
-    Returns:
-        Dictionary with training history:
-        - 'loss': List of loss values per step
-        - 'loss_s': List of subpart-level losses
-        - 'loss_p': List of part-level losses
-        - 'loss_w': List of whole-level losses
-    """
     import torch.nn.functional as F
     from tqdm import tqdm
 
     # Use the provided Neptune run
     run = neptune_run
 
-    # Log hyperparameters (if Neptune available)
-    if run is not None:
-        optimizer_params = optimizer.param_groups[0]
-        run["hyperparameters"] = {
-            "num_steps": num_steps,
-            "image_hw": str(image_hw),
-            "batch_size": batch_size,
-            "loss_type": loss_type,
-            "clip_prob": clip_prob,
-            "semantic_layer/hidden_dim": semantic_layer.hidden_dim,
-            "semantic_layer/n_hidden": semantic_layer.n_hidden,
-            "semantic_layer/latent_dim": semantic_layer.latent_dim,
-            "optimizer/lr": optimizer_params['lr'],
-            "optimizer/weight_decay": optimizer_params.get('weight_decay', 0.0),
-            "optimizer/name": optimizer.__class__.__name__,
-        }
-
-        # Log model parameters count
-        total_params = sum(p.numel() for p in semantic_layer.parameters())
-        trainable_params = sum(p.numel() for p in semantic_layer.parameters() if p.requires_grad)
-        run["model/total_parameters"] = total_params
-        run["model/trainable_parameters"] = trainable_params
-
     # Ensure grid_inr is frozen
     for param in grid_inr.parameters():
         param.requires_grad = False
 
     # Freeze autoencoder if provided
-    if autoencoder is not None:
-        autoencoder.eval()
-        for param in autoencoder.parameters():
-            param.requires_grad = False
+    autoencoder.eval()
+    for param in autoencoder.parameters():
+        param.requires_grad = False
+
+    # Precompute opacity once so semantic rendering no longer queries grid_inr
+    opacity_volume = precompute_opacity_volume(grid_inr, transfer_function)
 
     semantic_layer.train()
     history = {
@@ -823,156 +800,130 @@ def train_semantic_layer(
         'loss_w': [],
     }
 
-    pbar = tqdm(range(num_steps), desc="Training", ncols=100)
+    pbar = tqdm(range(num_steps), desc="Training")
     for step in pbar:
         optimizer.zero_grad()
-
-        # --- [NEW] Define a single, synchronized clip plane for this step ---
-        clip_plane = None
-        if torch.rand(1).item() < clip_prob:
-            # Random normal vector (uniformly distributed on unit sphere)
-            normal = F.normalize(torch.randn(3, device=device, dtype=dtype), dim=0)
-            # Random offset 'd' in range [-0.8, 0.8] (relative to [-1, 1] coords)
-            offset = (torch.rand(1, device=device, dtype=dtype) * 1.6 - 0.8).item()
-            clip_plane = (normal, offset)
-        # --- End [NEW] ---
 
         # ====================================================================
         # Path 1: Generate random render and CLIP ground truth
         # ====================================================================
 
-        # Generate random perspective render with same step size as semantic rendering
-        render_step_size = 2.0
-        img, camera = generate_random_render(
-            grid_inr=grid_inr,
-            transfer_function=transfer_function,
-            image_hw=image_hw,
-            clip_plane=clip_plane,
-            render_step_size=render_step_size,
-        )
+        # Explicitly disable gradients for ground truth generation to prevent memory leaks
+        with torch.no_grad():
+            # Generate random perspective render with same step size as semantic rendering
+            render_step_size = 2.0
+            img, camera = generate_random_render(
+                grid_inr=grid_inr,
+                transfer_function=transfer_function,
+                image_hw=image_hw,
+                render_step_size=render_step_size,
+            )
 
-        # Segment with SAM2
-        masks = segment_image_with_sam2(img, sam_generator=sam_generator)
+            # Segment with SAM2
+            masks = segment_image_with_sam2(img, sam_generator=sam_generator)
 
-        # Partition into hierarchies
-        groups = partition_masks_by_area(masks)
+            # Partition into hierarchies
+            groups = partition_masks_by_area(masks)
 
-        # Generate CLIP features (ground truth)
-        clip_feat_s, clip_feat_p, clip_feat_w = generate_clip_features_from_masks(
-            image=img,
-            masks_grouped=groups,
-            clip_model=clip_model,
-            clip_preprocess=clip_preprocess,
-        )
+            # Generate CLIP features (ground truth)
+            clip_feat_s, clip_feat_p, clip_feat_w = generate_clip_features_from_masks(
+                image=img,
+                masks_grouped=groups,
+                clip_model=clip_model,
+                clip_preprocess=clip_preprocess,
+            )
 
-        # ====================================================================
-        # Path 2: Render semantic features from the neural network
-        # ====================================================================
+        gt_feat_dict = {
+            's': clip_feat_s,
+            'p': clip_feat_p,
+            'w': clip_feat_w,
+        }
 
-        # Use same render_step_size as RGB rendering for consistent supervision
-        render_step_size = 2.0
-        render_feat_s, render_feat_p, render_feat_w = render_semantics(
-            grid_inr=grid_inr,
-            semantic_layer=semantic_layer,
-            camera=camera,
-            image_hw=image_hw,
-            batch_size=batch_size,
-            clip_plane=clip_plane,
-            transfer_function=transfer_function,
-            render_step_size=render_step_size,
-        )
-
-        # ====================================================================
-        # Compute loss between rendered and CLIP features
-        # ====================================================================
-
-        def compute_loss(pred_feat, target_feat_512, level_name):
+        def compute_loss(pred_feat, target_feat_512):
             """
-            Compute loss between predicted and target feature maps in latent space.
+            Compare predicted latent features against CLIP ground truth in decoder space.
 
             Args:
-                pred_feat: [H, W, latent_dim] (rendered latent features)
-                target_feat_512: [H, W, 512] (original CLIP features)
-                level_name: 's', 'p', or 'w' for logging
+                pred_feat: [H, W, latent_dim] latent predictions from semantic layer render
+                target_feat_512: [H, W, 512] CLIP embeddings from masks
 
             Returns:
-                Loss value (scalar tensor)
+                Tuple (loss_tensor, valid_count) where loss_tensor may be None if
+                there are no valid CLIP features for this head.
             """
-            latent_dim = pred_feat.shape[-1]
+            pred_flat = pred_feat.reshape(-1, pred_feat.shape[-1])
+            target_flat = target_feat_512.reshape(-1, target_feat_512.shape[-1])
 
-            # Flatten spatial dimensions
-            pred_flat = pred_feat.reshape(-1, latent_dim).to(dtype=torch.float32)
+            # Ignore pixels without CLIP supervision (all zeros)
+            valid_mask = target_flat.abs().sum(dim=-1) > 1e-6
+            valid_count = int(valid_mask.sum().item())
+            if valid_count == 0:
+                return None, 0
 
-            # Find pixels with non-zero target features (using original 512-D map)
-            target_512_flat = target_feat_512.reshape(-1, 512).to(dtype=torch.float32)
-            target_norm = target_512_flat.norm(dim=-1)
-            mask = target_norm > 0.1  # Only consider masked pixels
+            pred_valid = pred_flat[valid_mask]
+            target_valid = target_flat[valid_mask]
 
-            if mask.sum() == 0:
-                # No masked pixels at this level
-                return torch.tensor(0.0, device=device, dtype=dtype)
+            # Decode latent predictions back to CLIP space (autoencoder is frozen)
+            # Note: decoder must stay in computational graph for gradients to flow to pred_valid
+            # Memory cost: ~32 MB per head (acceptable for frozen decoder)
+            pred_clip = autoencoder.decoder(pred_valid)
 
-            pred_masked = pred_flat[mask]  # [N, latent_dim]
-            target_masked_512 = target_512_flat[mask]  # [N, 512]
+            similarity = F.cosine_similarity(pred_clip, target_valid, dim=-1)
+            loss = (1.0 - similarity).mean()
+            return loss, valid_count
 
-            if autoencoder is not None:
-                # Encode target CLIP features to latent space for comparison
-                # This matches the representation space the autoencoder optimized
-                with torch.no_grad():
-                    target_latent = autoencoder.encoder(target_masked_512)  # [N, latent_dim]
+        render_step_size = 2.0
+        step_loss_total = 0.0
+        head_losses: Dict[str, Optional[float]] = {'s': None, 'p': None, 'w': None}
+        accumulated_loss = None  # Accumulate losses before calling backward
 
-                # pred_masked is already in latent space [N, latent_dim]
-                # Compare in latent space
-                pred_norm = F.normalize(pred_masked, dim=-1)
-                target_norm = F.normalize(target_latent, dim=-1)
+        for head in ['p']:
+            render_feat = render_semantics(
+                head=head,
+                # grid_inr=grid_inr,
+                semantic_layer=semantic_layer,
+                camera=camera,
+                opacity_volume=opacity_volume,
+                image_hw=image_hw,
+                batch_size=batch_size,
+                render_step_size=render_step_size,
+            )
+
+            loss_tensor, valid_count = compute_loss(render_feat, gt_feat_dict[head])
+
+            if loss_tensor is None:
+                history[f'loss_{head}'].append(0.0)
+                if run is not None:
+                    run[f'train/loss_{head}'].append(0.0)
+                    run[f'train/masks_{head}'].append(len(groups[head]))
+                    run[f'train/valid_pixels_{head}'].append(valid_count)
+                continue
+
+            # Accumulate loss instead of calling backward immediately
+            # This prevents multiple computational graphs from being held in memory
+            if accumulated_loss is None:
+                accumulated_loss = loss_tensor
             else:
-                # No autoencoder: compare directly in 512-D space
-                pred_norm = F.normalize(pred_masked, dim=-1)
-                target_norm = F.normalize(target_masked_512, dim=-1)
+                accumulated_loss = accumulated_loss + loss_tensor
 
-            if loss_type == "cosine":
-                similarity = (pred_norm * target_norm).sum(dim=-1)  # [N]
-                loss = (1.0 - similarity).mean()
-            elif loss_type == "l1":
-                loss = F.l1_loss(pred_norm, target_norm)
-            else:  # l2
-                loss = F.mse_loss(pred_norm, target_norm)
+            loss_value = float(loss_tensor.item())
+            head_losses[head] = loss_value
+            step_loss_total += loss_value
+            history[f'loss_{head}'].append(loss_value)
+            if run is not None:
+                run[f'train/loss_{head}'].append(loss_value)
+                run[f'train/masks_{head}'].append(len(groups[head]))
+                run[f'train/valid_pixels_{head}'].append(valid_count)
 
-            return loss
-
-        loss_s = compute_loss(render_feat_s, clip_feat_s, 's')
-        loss_p = compute_loss(render_feat_p, clip_feat_p, 'p')
-        loss_w = compute_loss(render_feat_w, clip_feat_w, 'w')
-
-        # Total loss (equal weight for all levels)
-        total_loss = (loss_s + loss_p + loss_w) / 3.0
-
-        # ====================================================================
-        # Backprop and optimization
-        # ====================================================================
-
-        total_loss.backward()
-        optimizer.step()
-
-        # ====================================================================
-        # Logging
-        # ====================================================================
-
-        history['loss'].append(total_loss.item())
-        history['loss_s'].append(loss_s.item())
-        history['loss_p'].append(loss_p.item())
-        history['loss_w'].append(loss_w.item())
-
-        # Log to Neptune (if available)
+        history['loss'].append(step_loss_total)
         if run is not None:
-            run["train/loss"].append(total_loss.item())
-            run["train/loss_s"].append(loss_s.item())
-            run["train/loss_p"].append(loss_p.item())
-            run["train/loss_w"].append(loss_w.item())
-            run["train/masks_s"].append(len(groups['s']))
-            run["train/masks_p"].append(len(groups['p']))
-            run["train/masks_w"].append(len(groups['w']))
-            run["train/total_masks"].append(len(masks))
+            run['train/loss'].append(step_loss_total)
+
+        # Call backward once on accumulated loss to avoid holding multiple graphs
+        if accumulated_loss is not None:
+            accumulated_loss.backward()
+
+        optimizer.step()
 
         # Save debug images periodically
         if save_debug_every > 0 and step % save_debug_every == 0:
@@ -983,11 +934,14 @@ def train_semantic_layer(
             )
 
         # Update progress bar with loss information
+        def fmt_loss(val: Optional[float]) -> str:
+            return f'{val:.3f}' if val is not None else 'nan'
+
         pbar.set_postfix({
-            'loss': f'{total_loss.item():.4f}',
-            's': f'{loss_s.item():.3f}',
-            'p': f'{loss_p.item():.3f}',
-            'w': f'{loss_w.item():.3f}',
+            'loss': f'{step_loss_total:.4f}',
+            's': fmt_loss(head_losses['s']),
+            'p': fmt_loss(head_losses['p']),
+            'w': fmt_loss(head_losses['w']),
             'masks': f'{len(groups["s"])}|{len(groups["p"])}|{len(groups["w"])}'
         })
 
@@ -1005,15 +959,15 @@ def train_semantic_layer(
 # ==============================================================================
 
 def render_semantics(
-    grid_inr: "nn.Module",
+    head,
     semantic_layer: "nn.Module",
     camera: render.Camera,
+    opacity_volume: torch.Tensor,
     image_hw: Tuple[int, int] = (256, 256),
     batch_size: int = 8192,
     clip_plane: Optional[Tuple[torch.Tensor, float]] = None,
-    transfer_function: Optional[render.ParaViewTransferFunction] = None,
     render_step_size: float = 2.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Render semantic features using the adapted render_with_nerfacc.
 
@@ -1021,42 +975,30 @@ def render_semantics(
     by querying the semantic layer at sampled points along rays.
 
     Args:
-        grid_inr: The Stage 1 NGP model
+        head: Which semantic head to render ('s', 'p', or 'w')
         semantic_layer: SemanticLayer with three heads (s, p, w)
         camera: Camera for rendering viewpoint
+        opacity_volume: Precomputed opacity tensor with shape [D, H, W]
         image_hw: Output image resolution (height, width)
         batch_size: Number of rays to process per batch
         clip_plane: Optional (normal_vec, offset) tuple for 3D clipping
-        transfer_function: ParaView transfer function for alpha computation
 
     Returns:
-        Tuple of (feat_s, feat_p, feat_w), each [H, W, latent_dim] semantic feature maps
+        [H, W, latent_dim] semantic feature map for the requested head
     """
+    import torch.nn.functional as F
+
+    if opacity_volume.dim() == 3:
+        alpha_grid = opacity_volume.unsqueeze(0).unsqueeze(0)
+    elif opacity_volume.dim() == 5:
+        alpha_grid = opacity_volume
+    else:
+        raise ValueError("opacity_volume must have shape [D, H, W] or [1, 1, D, H, W]")
+
+    alpha_grid = alpha_grid.to(device=device, dtype=dtype)
+
     X, Y, Z = VOLUME_DIMS
     D_vol, H_vol, W_vol = Z, Y, X
-
-    # Precompute global min/max once per call by dense sampling
-    with torch.no_grad():
-        xs = torch.linspace(-1, 1, W_vol, device=device, dtype=dtype)
-        ys = torch.linspace(-1, 1, H_vol, device=device, dtype=dtype)
-        zs = torch.linspace(-1, 1, D_vol, device=device, dtype=dtype)
-        zz, yy, xx = torch.meshgrid(zs, ys, xs, indexing='ij')
-        coords_full = torch.stack([xx, yy, zz], dim=-1).view(-1, 3)
-        vals_full = grid_inr(coords_full).view(D_vol, H_vol, W_vol, 1)
-        v_min = vals_full.amin()
-        v_max = vals_full.amax()
-
-    # Build a torch 1D opacity LUT once, matching ParaView TF
-    # tf.opacity_points is shape [K, 2], columns = [value, opacity] in [0,1]
-    if transfer_function is not None:
-        lut_x = torch.from_numpy(transfer_function.opacity_points[:, 0]).to(device=device, dtype=dtype)
-        lut_y = torch.from_numpy(transfer_function.opacity_points[:, 1]).to(device=device, dtype=dtype)
-    else:
-        # Fallback to linear mapping if no transfer function provided
-        lut_x = None
-        lut_y = None
-
-    # Get latent_dim from semantic_layer
     latent_dim = semantic_layer.latent_dim
 
     def make_feature_fn(head_key: str, step_size: float):
@@ -1070,197 +1012,62 @@ def render_semantics(
         Returns:
             Function that takes pts [N, 3] and returns (features [N, latent_dim], sigmas [N])
         """
+
         def feature_fn(pts: torch.Tensor):
-            """
-            Compute semantic features and density at 3D points.
+            if pts.numel() == 0:
+                empty_feat = torch.zeros((0, latent_dim), device=device, dtype=dtype)
+                empty_sigma = torch.zeros((0,), device=device, dtype=dtype)
+                return empty_feat, empty_sigma
 
-            Args:
-                pts: [N, 3] world coordinates
-
-            Returns:
-                features: [N, latent_dim] semantic features
-                sigmas: [N] densities
-            """
-            # Normalize to [-1, 1] for INR
             pts_norm = torch.stack([
                 (pts[:, 0] / (W_vol - 1.0)) * 2.0 - 1.0 if W_vol > 1 else torch.zeros_like(pts[:, 0]),
                 (pts[:, 1] / (H_vol - 1.0)) * 2.0 - 1.0 if H_vol > 1 else torch.zeros_like(pts[:, 1]),
                 (pts[:, 2] / (D_vol - 1.0)) * 2.0 - 1.0 if D_vol > 1 else torch.zeros_like(pts[:, 2]),
             ], dim=-1).clamp(-1.0, 1.0)
 
-            # Query INR for scalar values in chunks to avoid CUDA errors
-            with torch.no_grad():
-                N = pts_norm.shape[0]
-                if N == 0:
-                    # Handle empty input
-                    values = torch.zeros((0, 1), device=device, dtype=dtype)
-                else:
-                    chunk_size = 1024  # Small chunks for tiny-cuda-nn
-                    values_list = []
-                    for i in range(0, N, chunk_size):
-                        chunk = pts_norm[i:i+chunk_size]
-                        values_chunk = grid_inr(chunk)
-                        values_list.append(values_chunk)
-                    values = torch.cat(values_list, dim=0) if len(values_list) > 1 else values_list[0]
+            sample_grid = torch.stack(
+                [pts_norm[:, 2], pts_norm[:, 1], pts_norm[:, 0]], dim=-1
+            ).view(1, 1, 1, -1, 3)
 
-            # Normalize values to [0, 1]
-            values_norm = (values - v_min) / (v_max - v_min + 1e-8)
-            values_norm = values_norm.clamp(0, 1)
-
-            # Create input for semantic layer: only (x, y, z) coordinates
-            semantic_input = pts_norm  # [N, 3]
-
-            # Get semantic features from ONLY the requested head for memory efficiency
-            N_sem = semantic_input.shape[0]
-            if N_sem == 0:
-                features = torch.zeros((0, latent_dim), device=device, dtype=dtype)
-            else:
-                # Process in smaller chunks to avoid OOM
-                chunk_size_sem = 512  # Reduced from 2048 to save memory
-                feat_list = []
-                for i in range(0, N_sem, chunk_size_sem):
-                    chunk = semantic_input[i:i+chunk_size_sem]
-                    # Only compute the requested head (saves memory and computation!)
-                    fs, fp, fw = semantic_layer(chunk, head=head_key)
-
-                    # Extract the non-None result
-                    if head_key == 's':
-                        feat_list.append(fs)
-                    elif head_key == 'p':
-                        feat_list.append(fp)
-                    else:  # 'w'
-                        feat_list.append(fw)
-
-                # Concatenate all chunks
-                features = torch.cat(feat_list, dim=0) if len(feat_list) > 1 else feat_list[0]
-                del feat_list  # Free list memory
-
-            # --- [NEW] Apply synchronized geometric clipping ---
-            if clip_plane is not None:
-                normal, offset = clip_plane
-                nx, ny, nz = normal[0], normal[1], normal[2]
-                d = offset
-
-                # pts_norm is [N, 3] (x, y, z) in [-1, 1]
-                dist = (pts_norm[:, 0] * nx + pts_norm[:, 1] * ny + pts_norm[:, 2] * nz) - d
-                clip_mask = (dist > 0)  # [N]
-
-                # Set density-contributing value to 0 for clipped points
-                # This will make their alpha and sigma zero
-                values_norm[clip_mask] = 0.0
-            # --- End [NEW] ---
-
-            # Compute density from (potentially modified) normalized value
-            if lut_x is not None and lut_y is not None:
-                # Piecewise-linear interpolation of the TF opacity curve
-                # searchsorted returns the bin index on lut_x for each values_norm
-                x = values_norm.squeeze(-1)
-                idx = torch.clamp(torch.searchsorted(lut_x, x, right=True) - 1, 0, lut_x.numel() - 2)
-                x0 = lut_x[idx]; x1 = lut_x[idx + 1]
-                y0 = lut_y[idx]; y1 = lut_y[idx + 1]
-                t = torch.clamp((x - x0) / (x1 - x0 + 1e-8), 0, 1)
-                alphas = (y0 * (1 - t) + y1 * t).clamp(0, 0.999)
-            else:
-                # Fallback to linear mapping
-                alphas = values_norm.squeeze(-1).clamp(0, 0.999)
-            # Convert alpha to sigma accounting for step length
-            # This ensures alpha_i ≈ 1 - exp(-sigma * Δt_i) is consistent
+            alphas = F.grid_sample(
+                alpha_grid,
+                sample_grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            ).view(-1)
+            alphas = alphas.clamp(0, 0.999)
             sigmas = -torch.log1p(-alphas) / step_size
 
+            semantic_input = pts_norm  # [N, 3]
+            N_sem = semantic_input.shape[0]
+            # Use reasonable chunk size for batched processing (was 1, causing massive overhead)
+            chunk_size_sem = 4096
+            feat_list = []
+            for i in range(0, N_sem, chunk_size_sem):
+                chunk = semantic_input[i:i+chunk_size_sem]
+                fs, fp, fw = semantic_layer(chunk, head=head_key)
+                if head_key == 's':
+                    feat_list.append(fs.to(dtype=dtype))
+                elif head_key == 'p':
+                    feat_list.append(fp.to(dtype=dtype))
+                else:  # 'w'
+                    feat_list.append(fw.to(dtype=dtype))
+            features = torch.cat(feat_list, dim=0) if len(feat_list) > 1 else feat_list[0]
             return features, sigmas
 
         return feature_fn
 
-    feat_s_img = render.render_with_nerfacc(
+    feat_img = render.render_with_nerfacc(
         camera=camera,
         hw=image_hw,
         spp=None,
         batch_size=batch_size,
-        feature_fn=make_feature_fn('s', render_step_size),
+        feature_fn=make_feature_fn(head, render_step_size),
         volume_dims=(D_vol, H_vol, W_vol),
         output_channels=latent_dim,
         render_step_size=render_step_size
     )
 
-    feat_p_img = render.render_with_nerfacc(
-        camera=camera,
-        hw=image_hw,
-        spp=None,
-        batch_size=batch_size,
-        feature_fn=make_feature_fn('p', render_step_size),
-        volume_dims=(D_vol, H_vol, W_vol),
-        output_channels=latent_dim,
-        render_step_size=render_step_size
-    )
+    return feat_img
 
-    feat_w_img = render.render_with_nerfacc(
-        camera=camera,
-        hw=image_hw,
-        spp=None,
-        batch_size=batch_size,
-        feature_fn=make_feature_fn('w', render_step_size),
-        volume_dims=(D_vol, H_vol, W_vol),
-        output_channels=latent_dim,
-        render_step_size=render_step_size
-    )
-
-    return feat_s_img, feat_p_img, feat_w_img
-
-
-if __name__ == "__main__":
-    """
-    Smoke test for the semantic rendering path using the Stage‑1 INR checkpoint.
-    """
-    import os
-    import sys
-    from model import SemanticLayer, NGP_TCNN
-
-    STAGE1_MODEL_PATH = "./models/stage1_ngp_tcnn.pth"
-
-    if device.type.startswith("cuda") and not torch.cuda.is_available():
-        print("[stage2] CUDA device requested but not available. Aborting smoke test.", flush=True)
-        sys.exit(1)
-
-    if not os.path.exists(STAGE1_MODEL_PATH):
-        print(f"[stage2] Missing Stage‑1 model checkpoint at {STAGE1_MODEL_PATH}", flush=True)
-        sys.exit(1)
-
-    try:
-        grid_inr = NGP_TCNN(opt).to(device)
-        state = torch.load(STAGE1_MODEL_PATH, map_location=device)
-        if isinstance(state, dict) and "model_state_dict" in state:
-            grid_inr.load_state_dict(state["model_state_dict"])
-        else:
-            grid_inr.load_state_dict(state)
-        grid_inr.eval()
-
-        semantic_layer = SemanticLayer(hidden_dim=64, n_hidden=2, latent_dim=3).to(device)
-        semantic_layer.eval()
-
-        camera = render.sample_random_perspective(grid_inr, polar_min_deg=70.0, polar_max_deg=110.0)
-
-        with torch.no_grad():
-            feat_s, feat_p, feat_w = render_semantics(
-                grid_inr=grid_inr,
-                semantic_layer=semantic_layer,
-                camera=camera,
-                image_hw=(32, 32),
-                batch_size=1024,
-            )
-
-        def summarize(name: str, tensor: torch.Tensor) -> str:
-            tensor = tensor.detach().cpu()
-            return (
-                f"{name}: shape={tuple(tensor.shape)} "
-                f"min={tensor.min():.4f} max={tensor.max():.4f} mean={tensor.mean():.4f}"
-            )
-
-        print("[stage2] Semantic render smoke test succeeded.")
-        print("  " + summarize("feat_s", feat_s))
-        print("  " + summarize("feat_p", feat_p))
-        print("  " + summarize("feat_w", feat_w))
-        sys.exit(0)
-
-    except Exception as exc:  # pragma: no cover - diagnostic path
-        print(f"[stage2] Semantic render smoke test failed: {exc}", flush=True)
-        sys.exit(1)

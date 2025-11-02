@@ -39,8 +39,9 @@ Common flags:
 
 Notes
 -----
-* The semantic head predicts 512‑D features from (x,y,z,v_norm) using three separate
-  heads (subpart, part, whole). We L2‑normalize both text features and per‑voxel
+* The semantic head predicts latent features via a hash‑grid encoder matched to
+  the Stage‑1 INR. Three heads (subpart, part, whole) share the encoder and map to
+  the autoencoder latent space. We L2‑normalize both text features and per‑voxel
   features and take cosine similarity.
 * In auto mode, the system selects the hierarchy level with the highest maximum
   activation, matching the training scheme in stage2.py.
@@ -199,47 +200,34 @@ class VolumeSemanticSearcher:
 
         # ---- Stage‑2 semantic head (latent) ----
         _ensure(os.path.exists(stage2_head_path), f"Missing Stage‑2 head at {stage2_head_path}")
-        head_state = torch.load(stage2_head_path, map_location="cpu")
+        head_loaded = torch.load(stage2_head_path, map_location="cpu")
 
-        def _infer_latent_dim(state_dict: Dict[str, torch.Tensor]) -> int:
-            # Try to find head weights (head_s, head_p, or head_w)
-            for head_key in ["head_s.weight", "head_p.weight", "head_w.weight"]:
-                if head_key in state_dict:
-                    # Output dimension is the first dimension of the weight matrix
-                    return int(state_dict[head_key].shape[0])
-            _ensure(False, "Unable to infer latent dimension from Stage-2 head state dict")
+        def _unwrap_state_dict(blob: object) -> Dict[str, torch.Tensor]:
+            if not isinstance(blob, dict):
+                return blob  # type: ignore[return-value]
+            for key in ("model_state_dict", "state_dict", "semantic_head", "module"):
+                inner = blob.get(key)
+                if isinstance(inner, dict):
+                    return inner  # type: ignore[return-value]
+            return blob  # type: ignore[return-value]
 
-        def _infer_trunk_params(state_dict: Dict[str, torch.Tensor]) -> Tuple[int, int]:
-            # Infer hidden_dim and n_hidden from trunk layer weights
-            # Trunk has structure: trunk.0.weight, trunk.0.bias, trunk.2.weight, trunk.2.bias, ...
-            # (with ReLU activation layers at odd indices)
-            hidden_dim = None
-            n_hidden = 0
-
-            for key in sorted(state_dict.keys()):
-                if key.startswith("trunk.") and key.endswith(".weight"):
-                    weight = state_dict[key]
-                    if hidden_dim is None:
-                        # First trunk layer: output dim is hidden_dim
-                        hidden_dim = int(weight.shape[0])
-                    n_hidden += 1
-
-            if hidden_dim is None or n_hidden == 0:
-                # Fallback to defaults if inference fails
-                return 256, 3
-
-            return hidden_dim, n_hidden
-
-        self.latent_dim = _infer_latent_dim(head_state)
-        hidden_dim, n_hidden = _infer_trunk_params(head_state)
-        self.semantic = SemanticLayer(hidden_dim=hidden_dim, n_hidden=n_hidden, latent_dim=self.latent_dim).to(device)
+        head_state = _unwrap_state_dict(head_loaded)
+        meta_tensor = head_state.get("_meta") if isinstance(head_state, dict) else None
+        if meta_tensor is None and isinstance(head_loaded, dict):
+            meta_tensor = head_loaded.get("_meta")
+        if meta_tensor is not None:
+            self.semantic = SemanticLayer.from_meta(meta_tensor).to(device)
+        else:
+            # Fallback for checkpoints without embedded metadata.
+            self.semantic = SemanticLayer().to(device)
         self.semantic.load_state_dict(head_state)
         self.semantic.eval()
+        self.latent_dim = self.semantic.latent_dim
 
         # ---- Load Autoencoder (if available) ----
         self.autoencoder = None
         if os.path.exists(autoencoder_path):
-            self.autoencoder = SceneAutoencoder(clip_dim=512, latent_dim=self.latent_dim).to(device)
+            self.autoencoder = SceneAutoencoder().to(device)
             self.autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
             self.autoencoder.eval()
         # If autoencoder is not available, we'll work directly with 512-D features
@@ -350,8 +338,6 @@ class VolumeSemanticSearcher:
         y_coords = torch.linspace(-1, 1, Hv, device=device, dtype=torch.float32)
         z_coords = torch.linspace(-1, 1, Dv, device=device, dtype=torch.float32)
 
-        v_norm_full = self._ensure_scalar_field()  # [D,H,W,1]
-
         voxels_per_slice = Hv * Wv
         max_voxels = max(voxels_per_slice, self.voxel_batch_cap)
         z_per_chunk = max(1, max_voxels // voxels_per_slice)
@@ -381,14 +367,12 @@ class VolumeSemanticSearcher:
             yy = yy_base.expand(depth, -1, -1)
             xx = xx_base.expand(depth, -1, -1)
             coords = torch.stack([xx, yy, z_chunk], dim=-1).reshape(-1, 3)
-            v_chunk = v_norm_full[start:end].reshape(-1, 1)
-            inputs = torch.cat([coords, v_chunk], dim=-1)
 
-            # Pass inputs through the trunk first to get 256-D features, then project via heads
-            trunk_feats = self.semantic.trunk(inputs)  # [N, 256]
-            for key, head in (("s", self.semantic.head_s), ("p", self.semantic.head_p), ("w", self.semantic.head_w)):
-                feats = head(trunk_feats).to(dtype=torch.float32)  # [N, d_feat]
-                flat = feats.view(-1, d_feat)
+            feat_s, feat_p, feat_w = self.semantic(coords)
+            for key, feats in (("s", feat_s), ("p", feat_p), ("w", feat_w)):
+                if feats is None:
+                    continue
+                flat = feats.to(dtype=torch.float32).view(-1, d_feat)
 
                 if self.autoencoder is not None:
                     decoded = self.autoencoder.decoder(flat)
@@ -398,10 +382,8 @@ class VolumeSemanticSearcher:
 
                 scores_flat = relevancy_score(flat_512, z_text, canonical_vectors)
                 S_levels[key][start:end] = scores_flat.view(depth, Hv, Wv)
-                del feats
-            del trunk_feats
 
-            del coords, v_chunk, inputs, z_chunk, yy, xx
+            del coords, z_chunk, yy, xx
 
         if pad > 0:
             weight = torch.ones((1, 1, kernel, kernel, kernel), device=device, dtype=torch.float32)

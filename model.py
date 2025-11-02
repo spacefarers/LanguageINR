@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from math import exp, log
+from typing import Optional, Sequence, Tuple, Union
 import tinycudann as tcnn
 
 
@@ -9,7 +10,7 @@ class SceneAutoencoder(nn.Module):
     Autoencoder to learn a scene-specific latent space for CLIP features.
     Maps 512-D CLIP features to a low-dimensional space (e.g., 8-D).
     """
-    def __init__(self, clip_dim: int = 512, latent_dim: int = 3, hidden_dim: int = 128):
+    def __init__(self):
         """
         Args:
             clip_dim: Input/output dimension (512 for CLIP ViT-B/32)
@@ -17,19 +18,20 @@ class SceneAutoencoder(nn.Module):
             hidden_dim: Intermediate dimension
         """
         super().__init__()
-        self.clip_dim = clip_dim
-        self.latent_dim = latent_dim
-
         self.encoder = nn.Sequential(
-            nn.Linear(clip_dim, hidden_dim),
+            nn.Linear(512, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, latent_dim)
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 3)
         )
 
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(3, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, clip_dim)
+            nn.Linear(64, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 512)
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -51,78 +53,159 @@ class SceneAutoencoder(nn.Module):
 
 class SemanticLayer(nn.Module):
     """
-    Semantic layer that maps voxel features to CLIP embedding space.
+    Semantic head powered by an NGP-style hash grid encoder.
 
-    Has three separate heads for hierarchical semantic features:
-    - head_s: Subpart-level features (512D)
-    - head_p: Part-level features (512D)
-    - head_w: Whole-level features (512D)
-
-    Input: (x, y, z) - 3D normalized voxel coordinates
-    Output: Three 512D feature vectors per voxel
+    This mirrors the Stage-1 NGP_TCNN architecture so the semantic predictions
+    can benefit from the same multi-resolution encoding used for densities.
     """
 
-    def __init__(self, hidden_dim: int = 256, n_hidden: int = 3, latent_dim: int = 512):
-        """
-        Args:
-            hidden_dim: Hidden layer dimension
-            n_hidden: Number of hidden layers in trunk
-            latent_dim: Output dimension (512 for CLIP)
-        """
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        n_hidden: int = 3,
+        latent_dim: int = 3,
+        hash_n_levels: int = 16,
+        hash_features_per_level: int = 2,
+        hash_log2_size: int = 19,
+        hash_base_resolution: int = 16,
+        hash_max_resolution: int = 256,
+    ) -> None:
         super().__init__()
+
+        if hash_n_levels < 1:
+            raise ValueError("hash_n_levels must be >= 1")
+        if hidden_dim <= 0 or n_hidden <= 0:
+            raise ValueError("hidden_dim and n_hidden must be positive")
+        if latent_dim <= 0:
+            raise ValueError("latent_dim must be positive")
 
         self.hidden_dim = hidden_dim
         self.n_hidden = n_hidden
         self.latent_dim = latent_dim
+        self.hash_n_levels = hash_n_levels
+        self.hash_features_per_level = hash_features_per_level
+        self.hash_log2_size = hash_log2_size
+        self.hash_base_resolution = hash_base_resolution
+        self.hash_max_resolution = hash_max_resolution
 
-        # Shared trunk that processes (x, y, z)
-        trunk_layers = []
-        trunk_layers.append(nn.Linear(3, hidden_dim))
-        trunk_layers.append(nn.ReLU(inplace=True))
+        if hash_n_levels == 1:
+            per_level_scale = 1.0
+        else:
+            per_level_scale = exp(
+                (log(hash_max_resolution) - log(hash_base_resolution))
+                / (hash_n_levels - 1)
+            )
 
-        for _ in range(n_hidden - 1):
-            trunk_layers.append(nn.Linear(hidden_dim, hidden_dim))
-            trunk_layers.append(nn.ReLU(inplace=True))
+        self.network = tcnn.NetworkWithInputEncoding(
+            n_input_dims=3,
+            n_output_dims=latent_dim * 3,
+            encoding_config={
+                "otype": "HashGrid",
+                "n_levels": hash_n_levels,
+                "n_features_per_level": hash_features_per_level,
+                "log2_hashmap_size": hash_log2_size,
+                "base_resolution": hash_base_resolution,
+                "per_level_scale": per_level_scale,
+            },
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": n_hidden,
+            },
+        )
 
-        self.trunk = nn.Sequential(*trunk_layers)
+        # Persist key hyperparameters so checkpoints are self-describing.
+        meta = torch.tensor(
+            [
+                latent_dim,
+                hash_n_levels,
+                hash_features_per_level,
+                hash_log2_size,
+                hash_base_resolution,
+                hash_max_resolution,
+                hidden_dim,
+                n_hidden,
+            ],
+            dtype=torch.int32,
+        )
+        self.register_buffer("_meta", meta, persistent=True)
 
-        # Three separate heads for each hierarchy level
-        self.head_s = nn.Linear(hidden_dim, latent_dim)  # Subpart
-        self.head_p = nn.Linear(hidden_dim, latent_dim)  # Part
-        self.head_w = nn.Linear(hidden_dim, latent_dim)  # Whole
+    @property
+    def meta(self) -> dict:
+        """Return a dictionary with the hash-grid and MLP hyperparameters."""
+        return {
+            "latent_dim": int(self._meta[0].item()),
+            "hash_n_levels": int(self._meta[1].item()),
+            "hash_features_per_level": int(self._meta[2].item()),
+            "hash_log2_size": int(self._meta[3].item()),
+            "hash_base_resolution": int(self._meta[4].item()),
+            "hash_max_resolution": int(self._meta[5].item()),
+            "hidden_dim": int(self._meta[6].item()),
+            "n_hidden": int(self._meta[7].item()),
+        }
 
-    def forward(self, x: torch.Tensor, head: str = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    @classmethod
+    def from_meta(cls, meta: Union[torch.Tensor, Sequence[int]]) -> "SemanticLayer":
         """
-        Forward pass through semantic layer.
+        Instantiate a SemanticLayer from a serialized meta tensor or sequence.
+        """
+        if isinstance(meta, torch.Tensor):
+            values = [int(v) for v in meta.view(-1).tolist()]
+        else:
+            values = [int(v) for v in meta]
+        if len(values) != 8:
+            raise ValueError(f"Expected 8 meta values, got {len(values)}")
+
+        latent_dim, hash_n_levels, hash_feat, hash_log2, hash_base, hash_max, hidden_dim, n_hidden = values
+        return cls(
+            hidden_dim=hidden_dim,
+            n_hidden=n_hidden,
+            latent_dim=latent_dim,
+            hash_n_levels=hash_n_levels,
+            hash_features_per_level=hash_feat,
+            hash_log2_size=hash_log2,
+            hash_base_resolution=hash_base,
+            hash_max_resolution=hash_max,
+        )
+
+    @staticmethod
+    def _split_outputs(output: torch.Tensor, latent_dim: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        feat = output.view(-1, 3, latent_dim)
+        return feat[:, 0, :], feat[:, 1, :], feat[:, 2, :]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        head: Optional[str] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Forward pass through the semantic hash-grid.
 
         Args:
-            x: [N, 3] tensor of (x, y, z) normalized coordinates
-            head: Optional head to compute ('s', 'p', 'w'). If None, computes all three.
+            x: [N, 3] tensor of normalized coordinates in [-1, 1].
+            head: Optional hierarchy selector ('s', 'p', 'w'). When provided,
+                  only the requested head is returned to save downstream work.
 
         Returns:
-            If head is None: Tuple of (feat_s, feat_p, feat_w), each [N, latent_dim]
-            If head is specified: Returns only the requested head as (feat, None, None)
-                                  or similar pattern based on which head
+            Tuple of (feat_s, feat_p, feat_w); entries not requested by `head`
+            are returned as None for API compatibility.
         """
-        # Shared trunk
-        features = self.trunk(x)
+        if x.ndim != 2 or x.shape[-1] != 3:
+            raise ValueError(f"SemanticLayer expects input of shape [N, 3], got {tuple(x.shape)}")
 
-        # If specific head requested, only compute that one (saves memory)
+        coords = torch.clamp((x + 1.0) * 0.5, 0.0, 1.0).to(dtype=torch.float32)
+        output = self.network(coords).float()
+        feat_s, feat_p, feat_w = self._split_outputs(output, self.latent_dim)
+
         if head == 's':
-            feat_s = self.head_s(features)
             return feat_s, None, None
-        elif head == 'p':
-            feat_p = self.head_p(features)
+        if head == 'p':
             return None, feat_p, None
-        elif head == 'w':
-            feat_w = self.head_w(features)
+        if head == 'w':
             return None, None, feat_w
-        else:
-            # Compute all three heads (for loss computation during training)
-            feat_s = self.head_s(features)
-            feat_p = self.head_p(features)
-            feat_w = self.head_w(features)
-            return feat_s, feat_p, feat_w
+        return feat_s, feat_p, feat_w
 
 
 class NGP_TCNN(nn.Module):

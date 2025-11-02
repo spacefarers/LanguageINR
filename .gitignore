@@ -7,3 +7,4 @@ keys.py
 *.png
 .neptune
 *.pt
+data
