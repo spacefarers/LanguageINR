@@ -3,35 +3,42 @@ import torch.nn as nn
 from math import exp, log
 from typing import Optional, Sequence, Tuple, Union
 import tinycudann as tcnn
+import torch.nn.functional as F
 
 
 class SceneAutoencoder(nn.Module):
     """
     Autoencoder to learn a scene-specific latent space for CLIP features.
-    Maps 512-D CLIP features to a low-dimensional space (e.g., 8-D).
     """
-    def __init__(self):
+
+    def __init__(self, clip_dim: int = 768, latent_dim: int = 3):
         """
         Args:
-            clip_dim: Input/output dimension (512 for CLIP ViT-B/32)
-            latent_dim: Bottleneck dimension (e.g., 8)
-            hidden_dim: Intermediate dimension
+            clip_dim: Input/output dimension for CLIP features.
+            latent_dim: Bottleneck dimension (default: 3)
         """
         super().__init__()
+        if clip_dim <= 0:
+            raise ValueError("clip_dim must be positive")
+        if latent_dim <= 0:
+            raise ValueError("latent_dim must be positive")
+        self.clip_dim = int(clip_dim)
+        self.latent_dim = int(latent_dim)
+
         self.encoder = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(self.clip_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 3)
+            nn.Linear(64, self.latent_dim),
         )
 
         self.decoder = nn.Sequential(
-            nn.Linear(3, 64),
+            nn.Linear(self.latent_dim, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 512)
+            nn.Linear(256, self.clip_dim),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -39,13 +46,15 @@ class SceneAutoencoder(nn.Module):
         Forward pass through the autoencoder.
 
         Args:
-            x: [N, 512] tensor of CLIP features
+            x: [N, clip_dim] tensor of CLIP features
 
         Returns:
             Tuple of (reconstructed, latent):
-            - reconstructed: [N, 512] reconstructed CLIP features
-            - latent: [N, 8] latent features
+            - reconstructed: [N, clip_dim] reconstructed CLIP features
+            - latent: [N, latent_dim] latent features
         """
+        if x.shape[-1] != self.clip_dim:
+            raise ValueError(f"Expected input dimension {self.clip_dim}, got {x.shape[-1]}")
         latent = self.encoder(x)
         reconstructed = self.decoder(latent)
         return reconstructed, latent

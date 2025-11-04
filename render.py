@@ -195,7 +195,7 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
             - features: [N, C] features (C = output_channels)
             - sigmas: [N] densities
         volume_dims: Tuple of (depth, height, width) if using feature_fn
-        output_channels: Number of output channels (3 for RGB, 512 for semantic)
+        output_channels: Number of output channels (3 for RGB, latent_dim*3 for semantic with 3 hierarchy heads)
         render_step_size: Step size for ray marching (default 2.0). Should be consistent
             between RGB and semantic rendering to avoid supervision mismatch.
     """
@@ -209,9 +209,6 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
         vol = rgba_volume.permute(3, 0, 1, 2).unsqueeze(0)
         depth, height, width = (int(vol.shape[-3]), int(vol.shape[-2]), int(vol.shape[-1]))
     else:
-        # Custom feature rendering
-        if feature_fn is None or volume_dims is None:
-            raise ValueError("Must provide either rgba_volume or (feature_fn + volume_dims)")
         depth, height, width = volume_dims
         vol = None
 
@@ -356,10 +353,6 @@ def render_with_nerfacc(rgba_volume: torch.Tensor = None,  # (D,H,W,4)
 
     # Reshape to [H, W, C]
     result = colors.view(hw[0], hw[1], output_channels)
-
-    # Only clamp for RGB output
-    if output_channels == 3:
-        result = result.clamp(0, 1)
 
     return result
 

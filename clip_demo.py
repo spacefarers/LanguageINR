@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-LSeg Text-Image Similarity Demo
-================================
+CLIPSeg Text-Image Similarity Demo
+==================================
 
 Pick an image, type a prompt, and visualize a dense per-pixel correlation map
-computed with LSeg between the prompt embedding and the image. The overlay
+computed with CLIPSeg between the prompt embedding and the image. The overlay
 highlights regions that respond strongly to the entered phrase.
 """
 
@@ -14,13 +14,13 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     from PIL import Image, ImageTk
-except ImportError as exc:
+except ImportError as exc:  # pragma: no cover - GUI dependency guard
     print("Error: GUI dependencies not found:", exc)
     print("Install with: pip install pillow")
     sys.exit(1)
@@ -29,39 +29,37 @@ try:
     import numpy as np
     import torch
     import torch.nn.functional as F
-except ImportError as exc:
+    from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
+except ImportError as exc:  # pragma: no cover - runtime guard
     print("Error: required package not found:", exc)
     print("Install dependencies from requirements.txt and try again.")
     raise
 
-# Import LSeg module
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "encoders", "lseg_encoder"))
-from modules.lseg_module import LSegModule
 
+class CLIPSegDemoGUI:
+    """Interactive CLIPSeg visualization GUI."""
 
-class LSegDemoGUI:
-    """Interactive LSeg visualization GUI."""
-
-    def __init__(self, root: tk.Tk, checkpoint_path: str, device: str):
+    def __init__(self, root: tk.Tk, model_name: str, device: str):
         self.root = root
-        self.root.title("LSeg Text-Image Demo")
+        self.root.title("CLIPSeg Text-Image Demo")
         self.root.geometry("960x780")
         self.root.resizable(True, True)
 
-        self.checkpoint_path = checkpoint_path
+        self.model_name = model_name
         self.device = device
 
-        self.lseg_model: Optional[LSegModule] = None
+        self.clipseg_model: Optional[CLIPSegForImageSegmentation] = None
+        self.clipseg_processor: Optional[CLIPSegProcessor] = None
 
         self.selected_image_path: Optional[Path] = None
         self.original_image: Optional[Image.Image] = None
         self.display_image: Optional[Image.Image] = None
         self.photo_image: Optional[ImageTk.PhotoImage] = None
         self.last_heatmap: Optional[np.ndarray] = None
+        self.image_inputs: Optional[Dict[str, torch.Tensor]] = None
 
-        self.overlay_only_var = tk.BooleanVar(value=False)
         self._setup_ui()
-        self._load_lseg_model()
+        self._load_clipseg_model()
 
     # ------------------------------------------------------------------
     # UI setup
@@ -85,7 +83,7 @@ class LSegDemoGUI:
         prompt_row = ttk.Frame(control_frame)
         prompt_row.pack(fill=tk.X, pady=5)
         ttk.Label(prompt_row, text="Prompt:").pack(side=tk.LEFT)
-        self.prompt_var = tk.StringVar(value="tree")
+        self.prompt_var = tk.StringVar(value="highlight the tree trunk")
         prompt_entry = ttk.Entry(prompt_row, textvariable=self.prompt_var)
         prompt_entry.pack(side=tk.LEFT, padx=(5, 10), fill=tk.X, expand=True)
         prompt_entry.bind("<Return>", lambda _event: self._visualize())
@@ -104,21 +102,12 @@ class LSegDemoGUI:
             orient=tk.HORIZONTAL,
         )
         overlay_scale.pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
-        overlay_scale.configure(command=lambda _value: self._on_overlay_strength_change())
-
-        self.overlay_only_checkbox = ttk.Checkbutton(
-            overlay_row,
-            text="Hide original image",
-            variable=self.overlay_only_var,
-            command=self._update_display,
-        )
-        self.overlay_only_checkbox.pack(side=tk.LEFT, padx=(10, 0))
 
         # Status / similarity info
         info_frame = ttk.Frame(control_frame)
         info_frame.pack(fill=tk.X, pady=(10, 0))
 
-        self.status_label = ttk.Label(info_frame, text="Loading LSeg...", foreground="blue")
+        self.status_label = ttk.Label(info_frame, text="Loading CLIPSeg...", foreground="blue")
         self.status_label.pack(fill=tk.X)
 
         self.mean_label = ttk.Label(info_frame, text="Mean correlation: —")
@@ -138,53 +127,27 @@ class LSegDemoGUI:
     # ------------------------------------------------------------------
     # Model handling
     # ------------------------------------------------------------------
-    def _load_lseg_model(self) -> None:
-        """Load LSeg weights and processor."""
+    def _load_clipseg_model(self) -> None:
+        """Load CLIPSeg weights and processor."""
         try:
             self.status_label.config(
-                text=f"Loading LSeg model from: {self.checkpoint_path}",
+                text=f"Loading CLIPSeg model: {self.model_name}",
                 foreground="blue",
             )
             self.root.update_idletasks()
 
-            # Load LSeg module from checkpoint
-            self.lseg_model = LSegModule.load_from_checkpoint(
-                checkpoint_path=self.checkpoint_path,
-                data_path=None,
-                dataset='ignore',
-                backbone='clip_vitl16_384',
-                aux=False,
-                num_features=256,
-                aux_weight=0,
-                se_loss=False,
-                se_weight=0,
-                base_lr=0,
-                batch_size=1,
-                max_epochs=0,
-                ignore_index=-1,
-                dropout=0.0,
-                scale_inv=True,
-                augment=False,
-                no_batchnorm=False,
-                widehead=False,
-                widehead_hr=False,
-                map_locatin="cpu",
-                arch_option=0,
-                strict=False,
-                block_depth=0,
-                activation='lrelu',
-            )
-            
-            self.lseg_model.to(self.device)
-            self.lseg_model.eval()
+            self.clipseg_processor = CLIPSegProcessor.from_pretrained(self.model_name)
+            self.clipseg_model = CLIPSegForImageSegmentation.from_pretrained(self.model_name)
+            self.clipseg_model.to(self.device)
+            self.clipseg_model.eval()
 
             self.status_label.config(
                 text=f"Model ready on {self.device}. Select an image to start.",
                 foreground="green",
             )
-        except Exception as exc:
-            self.status_label.config(text=f"Failed to load LSeg: {exc}", foreground="red")
-            messagebox.showerror("Model Error", f"Could not load LSeg model:\n{exc}")
+        except Exception as exc:  # pragma: no cover - runtime guard
+            self.status_label.config(text=f"Failed to load CLIPSeg: {exc}", foreground="red")
+            messagebox.showerror("Model Error", f"Could not load CLIPSeg model:\n{exc}")
             raise
 
     # ------------------------------------------------------------------
@@ -207,13 +170,32 @@ class LSegDemoGUI:
         self.original_image = image
         self.display_image = image.copy()
         self.last_heatmap = None
+        self.image_inputs = None
+
+        if self.clipseg_processor:
+            try:
+                self.status_label.config(text="Processing image features...", foreground="blue")
+                self.root.update_idletasks()
+
+                img_inputs = self.clipseg_processor(images=self.original_image, return_tensors="pt")
+                self.image_inputs = {k: v.to(self.device) for k, v in img_inputs.items()}
+
+                self.status_label.config(
+                    text="Image loaded. Enter a prompt and click Visualize.",
+                    foreground="blue",
+                )
+            except Exception as exc:
+                self.status_label.config(text=f"Failed to process image: {exc}", foreground="red")
+                messagebox.showerror("Image Error", f"Failed to process image:\n{exc}")
+                self.image_inputs = None
+        else:  # pragma: no cover - defensive
+            self.image_inputs = None
 
         self.image_label.config(text=str(self.selected_image_path))
-        self.status_label.config(text="Image loaded. Enter a prompt and click Visualize.", foreground="blue")
         self.mean_label.config(text="Mean correlation: —")
         self.max_label.config(text="Max correlation: —")
 
-        self._update_display()
+        self._display_image(self.display_image)
 
     def _display_image(self, image: Image.Image) -> None:
         """Render an image on the canvas, preserving aspect ratio."""
@@ -241,9 +223,9 @@ class LSegDemoGUI:
     # Visualization logic
     # ------------------------------------------------------------------
     def _visualize(self) -> None:
-        """Run LSeg on the current image and overlay similarity heatmap."""
-        if self.lseg_model is None:
-            messagebox.showerror("Model Error", "LSeg model is not ready.")
+        """Run CLIPSeg on the current image and overlay similarity heatmap."""
+        if self.clipseg_model is None or self.clipseg_processor is None:
+            messagebox.showerror("Model Error", "CLIPSeg model is not ready.")
             return
 
         if self.original_image is None:
@@ -259,7 +241,7 @@ class LSegDemoGUI:
         self.root.update_idletasks()
 
         try:
-            heatmap, mean_score, max_score = self._compute_lseg_heatmap(self.original_image, prompt)
+            heatmap, mean_score, max_score = self._compute_clipseg_heatmap(prompt)
         except Exception as exc:
             self.status_label.config(text=f"Error during computation: {exc}", foreground="red")
             messagebox.showerror("Computation Error", f"Failed to compute similarity:\n{exc}")
@@ -269,59 +251,51 @@ class LSegDemoGUI:
         self.mean_label.config(text=f"Mean correlation: {mean_score:.4f}")
         self.max_label.config(text=f"Max correlation: {max_score:.4f}")
 
-        self._update_display()
+        overlay = self._apply_overlay(self.original_image, heatmap)
+        self.display_image = overlay
+        self._display_image(self.display_image)
 
         self.status_label.config(text="Done. Adjust prompt or overlay strength and try again.", foreground="green")
 
-    def _compute_lseg_heatmap(self, image: Image.Image, prompt: str) -> Tuple[np.ndarray, float, float]:
-        """Compute a dense LSeg similarity map for the given prompt."""
-        if self.lseg_model is None:
-            raise RuntimeError("LSeg model is not loaded.")
+    def _compute_clipseg_heatmap(self, prompt: str) -> Tuple[np.ndarray, float, float]:
+        """Compute a dense CLIPSeg similarity map for the given prompt."""
+        if self.clipseg_processor is None or self.clipseg_model is None:  # pragma: no cover - defensive
+            raise RuntimeError("CLIPSeg model is not loaded.")
 
-        # Prepare image using LSeg's transform
-        input_transform = self.lseg_model.val_transform
-        img_tensor = input_transform(image).unsqueeze(0).to(self.device)
+        if self.image_inputs is None or self.original_image is None:
+            raise RuntimeError("Image is not loaded or processed.")
 
-        # Get text labels - LSeg expects labels as a list
-        labels = [prompt]
-        
+        text_inputs = self.clipseg_processor(text=[prompt], return_tensors="pt")
+        text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
+
+        inputs = {**self.image_inputs, **text_inputs}
+
         with torch.no_grad():
-            # Forward through model to get per-pixel features
-            features = self.lseg_model.net.forward(img_tensor, labelset=labels, return_feature=True)
+            outputs = self.clipseg_model(**inputs)
 
-            # Get text embeddings
-            import open_clip
-            text_tokens = open_clip.tokenize(labels).to(self.device)
-            text_features = self.lseg_model.net.clip_pretrained.encode_text(text_tokens)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            
-            # Ensure consistent dtype (convert both to float32)
-            features = features.float()
-            text_features = text_features.float()
-            
-            # Compute similarity between image features and text
-            # features shape: [B, C, H, W], text_features: [num_labels, C]
-            features_flat = features.permute(0, 2, 3, 1).reshape(-1, features.shape[1])
-            features_flat = features_flat / features_flat.norm(dim=-1, keepdim=True)
-            
-            similarity = features_flat @ text_features.t()
-            similarity = similarity.reshape(features.shape[0], features.shape[2], features.shape[3], -1)
-            similarity = similarity[0, :, :, 0]  # Get first image, first label
+        logits = outputs.logits
+        probs = torch.sigmoid(logits)
 
-        # Resize to original image size
-        similarity_resized = F.interpolate(
-            similarity.unsqueeze(0).unsqueeze(0),
-            size=(image.height, image.width),
+        if probs.ndim == 3:
+            probs = probs.unsqueeze(1)
+        elif probs.ndim != 4:  # pragma: no cover - defensive
+            raise ValueError(f"Unexpected logits shape from CLIPSeg: {tuple(probs.shape)}")
+
+        # Resize to the original image resolution
+        probs = F.interpolate(
+            probs,
+            size=(self.original_image.height, self.original_image.width),
             mode="bilinear",
             align_corners=False,
         )
-        
-        prob_map = similarity_resized[0, 0].cpu().numpy()
-        
+
+        prob_map = probs[0, 0].cpu().numpy()
+        prob_map = np.clip(prob_map, 0.0, 1.0)
+
         mean_score = float(prob_map.mean())
         max_score = float(prob_map.max())
 
-        # Normalize for visualization
+        # Normalize for visualization while keeping correlations meaningful
         if prob_map.max() > prob_map.min():
             heatmap = (prob_map - prob_map.min()) / (prob_map.max() - prob_map.min())
         else:
@@ -335,63 +309,26 @@ class LSegDemoGUI:
         strength = max(0.0, min(1.0, strength))
 
         base = np.array(image).astype(np.float32) / 255.0
-        heat_rgb = self._heatmap_to_rgb(heatmap, base.shape)
         heat = np.clip(heatmap, 0.0, 1.0)
+
+        # Simple blue→red gradient for visualization
+        heat_rgb = np.zeros_like(base)
+        heat_rgb[..., 0] = heat  # red channel
+        heat_rgb[..., 1] = heat * 0.6  # green channel
+        heat_rgb[..., 2] = (1.0 - heat) * 0.4  # blue channel fades with heat
 
         alpha = (heat[..., None] * strength).astype(np.float32)
         blended = base * (1.0 - alpha) + heat_rgb * alpha
         blended = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
         return Image.fromarray(blended)
 
-    def _render_overlay_only(self, heatmap: np.ndarray) -> Image.Image:
-        """Render the overlay without the original image."""
-        overlay = self._heatmap_to_rgb(heatmap)
-        overlay = np.clip(overlay * 255.0, 0, 255).astype(np.uint8)
-        return Image.fromarray(overlay)
-
-    def _heatmap_to_rgb(self, heatmap: np.ndarray, reference_shape: Optional[Tuple[int, int, int]] = None) -> np.ndarray:
-        """Convert a normalized heatmap to an RGB array."""
-        heat = np.clip(heatmap, 0.0, 1.0)
-        if reference_shape is None:
-            shape = heat.shape + (3,)
-        else:
-            shape = reference_shape
-        heat_rgb = np.zeros(shape, dtype=np.float32)
-        heat_rgb[..., 0] = heat  # red channel
-        heat_rgb[..., 1] = heat * 0.6  # green channel
-        heat_rgb[..., 2] = (1.0 - heat) * 0.4  # blue channel fades with heat
-        return heat_rgb
-
-    def _update_display(self) -> None:
-        """Update canvas based on current overlay settings."""
-        if self.original_image is None:
-            self.canvas.delete("all")
-            self.display_image = None
-            self.photo_image = None
-            return
-
-        if self.overlay_only_var.get() and self.last_heatmap is not None:
-            image_to_show = self._render_overlay_only(self.last_heatmap)
-        elif self.last_heatmap is not None:
-            image_to_show = self._apply_overlay(self.original_image, self.last_heatmap)
-        else:
-            image_to_show = self.original_image
-
-        self.display_image = image_to_show
-        self._display_image(image_to_show)
-
-    def _on_overlay_strength_change(self) -> None:
-        """Refresh display when overlay strength slider moves."""
-        if self.last_heatmap is not None and not self.overlay_only_var.get():
-            self._update_display()
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LSeg Text-Image Similarity Demo GUI")
+    parser = argparse.ArgumentParser(description="CLIPSeg Text-Image Similarity Demo GUI")
     parser.add_argument(
-        "--checkpoint",
-        default="encoders/lseg_encoder/demo_e200.ckpt",
-        help="LSeg checkpoint path (default: encoders/lseg_encoder/demo_e200.ckpt)",
+        "--model",
+        default="CIDAS/clipseg-rd64-refined",
+        help="CLIPSeg model name (default: CIDAS/clipseg-rd64-refined)",
     )
     parser.add_argument(
         "--device",
@@ -401,7 +338,7 @@ def main() -> None:
     args = parser.parse_args()
 
     root = tk.Tk()
-    gui = LSegDemoGUI(root, checkpoint_path=args.checkpoint, device=args.device)
+    gui = CLIPSegDemoGUI(root, model_name=args.model, device=args.device)
 
     button_frame = ttk.Frame(root, padding=(10, 0, 10, 10))
     button_frame.pack(fill=tk.X)
@@ -411,13 +348,14 @@ def main() -> None:
     root.mainloop()
 
 
-def _clear_image(gui: LSegDemoGUI) -> None:
+def _clear_image(gui: CLIPSegDemoGUI) -> None:
     """Clear current image and reset display."""
     gui.selected_image_path = None
     gui.original_image = None
     gui.display_image = None
     gui.photo_image = None
     gui.last_heatmap = None
+    gui.image_inputs = None
     gui.image_label.config(text="No image selected")
     gui.mean_label.config(text="Mean correlation: —")
     gui.max_label.config(text="Max correlation: —")

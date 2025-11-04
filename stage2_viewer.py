@@ -1,56 +1,3 @@
-# stage2_viewer.py
-"""
-Stage-2 Semantic Viewer (from scratch)
-
-This viewer lets you:
-- Load the Stage‑1 grid INR and the Stage‑2 semantic head
-- Type a phrase and compute a text‑conditioned 3D similarity grid
-- Render a masked highlight that consistently reveals the most similar region
-
-Design goals
-------------
-* Pure-Python orchestration; all heavy lifting is delegated to the existing project
-  modules (renderer, CLIP model, INR + semantic head).
-* Robustness: gracefully handles missing GUI dependencies and provides a CLI fallback.
-* Efficiency: builds the similarity grid in depth chunks to keep VRAM bounded and
-  supports optional local 3D feature aggregation.
-
-Key references (code this module relies on)
--------------------------------------------
-- stage2.py: differentiable sampling of the INR, CLIP utilities, and the
-  SemanticLayer definition (512‑D features). We rely on the shared embedding space
-  (visual/text) to compare per‑voxel semantic features with CLIP text embeddings.
-- render.py: Camera and render_with_nerfacc renderer.
-- model.py: NGP_TCNN hash‑grid INR and SemanticLayer with three hierarchical heads.
-
-Usage
------
-Default (GUI if available, otherwise CLI):
-    python stage2_viewer.py
-
-CLI mode (explicit):
-    python stage2_viewer.py --cli --phrase "thin branches" --save out.png
-
-Common flags:
-    --stage1 ./models/stage1_ngp_tcnn.pth
-    --head   ./models/stage2_semantic_head.pth
-    --tf     ./paraview_tf/bonsai.json
-    --res 512 --threshold 0.30 --agg 3 --blob 0
-
-Notes
------
-* The semantic head predicts latent features via a hash‑grid encoder matched to
-  the Stage‑1 INR. Three heads (subpart, part, whole) share the encoder and map to
-  the autoencoder latent space. We L2‑normalize both text features and per‑voxel
-  features and take cosine similarity.
-* In auto mode, the system selects the hierarchy level with the highest maximum
-  activation, matching the training scheme in stage2.py.
-* The highlight is applied by modulating the alpha channel of the RGBA volume and
-  rendering with the shared NerfAcc renderer to guarantee view consistency.
-
-Copyright (c) 2025
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -66,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 # Project imports
-from config import device, opt, dtype, TRANSFER_FUNCTION_PATH, VOLUME_DIMS  # type: ignore
+from config import device, opt, dtype, TRANSFER_FUNCTION_PATH, VOLUME_DIMS, VOLUME_NAME  # type: ignore
 from model import NGP_TCNN, SemanticLayer, SceneAutoencoder  # type: ignore
 from render import Camera, render_with_nerfacc, ParaViewTransferFunction  # type: ignore
 import stage2  # type: ignore
@@ -76,9 +23,9 @@ import stage2  # type: ignore
 # Constants / Defaults
 # ------------------------------
 
-STAGE1_PATH_DEFAULT    = "./models/stage1_ngp_tcnn.pth"
-STAGE2_HEAD_DEFAULT    = "./models/stage2_semantic_head.pth"
-STAGE2_AUTOENCODER_DEFAULT = "./models/stage2_autoencoder.pth"
+STAGE1_PATH_DEFAULT    = f"./models/stage1_{VOLUME_NAME}.pth"
+STAGE2_HEAD_DEFAULT    = f"./models/stage2_{VOLUME_NAME}_semantic_head.pth"
+STAGE2_AUTOENCODER_DEFAULT = f"./models/stage2_{VOLUME_NAME}_autoencoder.pth"
 TRANSFER_FUNCTION_DEFAULT = TRANSFER_FUNCTION_PATH  # Imported from config.py
 CANONICAL_NEGATIVE_PHRASES = ["object", "things", "stuff", "texture"]
 
@@ -124,27 +71,19 @@ def relevancy_score(
     canonical_negatives: List[torch.Tensor],
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """
-    Compute relevancy score by contrasting query with canonical negatives.
-
-    Args:
-        features: [N, D] normalized feature vectors
-        query: [D] normalized query vector
-        canonical_negatives: List of [D] normalized negative vectors
-        eps: Small epsilon for numerical stability
-
-    Returns:
-        [N] relevancy scores
-    """
-    query = _normalize(query, eps=eps).view(1, -1)  # [1, D]
-    pos_sim = (features @ query.T).squeeze(-1)  # [N]
+    query = query.view(1, -1)
+    pos_sim = F.cosine_similarity(
+        features, query.expand_as(features), dim=-1, eps=eps
+    )
 
     if not canonical_negatives:
         return pos_sim
 
     # Stack negatives: [K, D]
     neg_stack = torch.stack(canonical_negatives, dim=0)  # [K, D]
-    neg_sim = features @ neg_stack.T  # [N, K]
+    neg_sim = F.cosine_similarity(
+        features.unsqueeze(1), neg_stack.unsqueeze(0), dim=-1, eps=eps
+    )
     neg_max = neg_sim.max(dim=-1).values  # [N]
 
     # Contrast: emphasize query over negatives while preserving dynamic range.
@@ -194,8 +133,8 @@ class VolumeSemanticSearcher:
             self.grid_inr.load_state_dict(ckpt)
         self.grid_inr.eval()
 
-        # ---- CLIP model (text/visual encoders share 512‑D space) ----
-        self.clip_model, self.clip_preprocess = stage2.load_clip_model(model_name="ViT-B/32")
+        # ---- CLIP model (text/visual encoders share 768‑D space) ----
+        self.clip_model, self.clip_preprocess = stage2.load_clip_model()
         self.clip_model.eval()
 
         # ---- Stage‑2 semantic head (latent) ----
@@ -230,7 +169,7 @@ class VolumeSemanticSearcher:
             self.autoencoder = SceneAutoencoder().to(device)
             self.autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
             self.autoencoder.eval()
-        # If autoencoder is not available, we'll work directly with 512-D features
+        # If autoencoder is not available, we'll work directly with 768-D features
 
         # ---- Transfer function ----
         self.transfer_fn = ParaViewTransferFunction(transfer_fn_path)
@@ -246,7 +185,7 @@ class VolumeSemanticSearcher:
         self._S_levels: Dict[str, torch.Tensor] = {}
         self.hierarchy_mode: str = "part"
         self._selected_level: Optional[str] = None
-        self._default_use_canonical: bool = True
+        self._default_use_canonical: bool = False
         self._canonical_embeddings: Optional[List[torch.Tensor]] = None
 
     def set_canonical_negatives_enabled(self, enabled: bool) -> None:
@@ -256,12 +195,31 @@ class VolumeSemanticSearcher:
     def canonical_negatives_enabled(self) -> bool:
         return self._default_use_canonical
 
+    def _project_text_embedding(self, embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Map a 768-D CLIP embedding into the latent space expected by the semantic head.
+        """
+        vec = embedding.to(device=device, dtype=torch.float32)
+        if self.autoencoder is not None:
+            with torch.no_grad():
+                latent = self.autoencoder.encoder(vec.unsqueeze(0)).squeeze(0)
+        else:
+            latent = vec
+
+        latent = latent.to(device=device, dtype=dtype)
+        if latent.shape[-1] != self.latent_dim:
+            raise RuntimeError(
+                f"Latent dimension mismatch: expected {self.latent_dim}, got {latent.shape[-1]}"
+            )
+        return latent
+
     def _get_canonical_embeddings(self) -> List[torch.Tensor]:
         if self._canonical_embeddings is None:
             embeddings: List[torch.Tensor] = []
             for phrase in CANONICAL_NEGATIVE_PHRASES:
                 try:
-                    embeddings.append(self.encode_text(phrase).detach())
+                    clip_z = self.encode_text(phrase).detach()
+                    embeddings.append(self._project_text_embedding(clip_z))
                 except Exception:
                     # Skip phrases that fail to encode for any reason.
                     continue
@@ -286,13 +244,13 @@ class VolumeSemanticSearcher:
 
     @torch.no_grad()
     def encode_text(self, phrase: str) -> torch.Tensor:
-        """512‑D CLIP text embedding (normalized)."""
+        """768‑D CLIP text embedding (normalized)."""
         import open_clip
         # Tokenize and encode text
         text = open_clip.tokenize([phrase]).to(device)
-        z = self.clip_model.encode_text(text)  # [1, 512]
-        z = z.squeeze(0)  # [512]
-        return _normalize(z.to(device=device, dtype=torch.float32))
+        z = self.clip_model.encode_text(text)  # [1, 768]
+        z = z.squeeze(0)  # [768]
+        return z.to(device=device, dtype=torch.float32)
 
     @torch.no_grad()
     def _build_rgba(self) -> torch.Tensor:
@@ -323,89 +281,87 @@ class VolumeSemanticSearcher:
         use_canonical: Optional[bool] = None,
     ) -> None:
         """Build similarity grids for each hierarchy level and cache the selection."""
-        Dv, Hv, Wv = self._Dv, self._Hv, self._Wv
-        mode = (hierarchy_mode or self.hierarchy_mode or "auto").lower()
+        try:
+            Dv, Hv, Wv = self._Dv, self._Hv, self._Wv
+            mode = (hierarchy_mode or self.hierarchy_mode or "auto").lower()
 
-        # Reset cached similarity to release memory from previous queries.
-        self._S = None
-        self._S_levels = {}
-        self._selected_level = None
+            # Reset cached similarity to release memory from previous queries.
+            self._S = None
+            self._S_levels = {}
+            self._selected_level = None
 
-        # Normalize query embedding
-        z_text = _normalize(z_text).to(device=device, dtype=torch.float32)
+            with torch.no_grad():
+                z_text = self.autoencoder.encoder(z_text.unsqueeze(0)).squeeze(0)
 
-        x_coords = torch.linspace(-1, 1, Wv, device=device, dtype=torch.float32)
-        y_coords = torch.linspace(-1, 1, Hv, device=device, dtype=torch.float32)
-        z_coords = torch.linspace(-1, 1, Dv, device=device, dtype=torch.float32)
+            x_coords = torch.linspace(-1, 1, Wv, device=device, dtype=torch.float32)
+            y_coords = torch.linspace(-1, 1, Hv, device=device, dtype=torch.float32)
+            z_coords = torch.linspace(-1, 1, Dv, device=device, dtype=torch.float32)
 
-        voxels_per_slice = Hv * Wv
-        max_voxels = max(voxels_per_slice, self.voxel_batch_cap)
-        z_per_chunk = max(1, max_voxels // voxels_per_slice)
+            voxels_per_slice = Hv * Wv
+            max_voxels = max(voxels_per_slice, self.voxel_batch_cap)
+            z_per_chunk = max(1, max_voxels // voxels_per_slice)
 
-        pad = max(0, int(aggregation_radius))
-        kernel = 2 * pad + 1
+            pad = max(0, int(aggregation_radius))
+            kernel = 2 * pad + 1
 
-        S_levels = {
-            "s": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
-            "p": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
-            "w": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
-        }
+            S_levels = {
+                "s": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
+                "p": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
+                "w": torch.empty((Dv, Hv, Wv), device=device, dtype=torch.float32),
+            }
 
-        yy_base, xx_base = torch.meshgrid(y_coords, x_coords, indexing="ij")
-        yy_base = yy_base.unsqueeze(0)
-        xx_base = xx_base.unsqueeze(0)
+            yy_base, xx_base = torch.meshgrid(y_coords, x_coords, indexing="ij")
+            yy_base = yy_base.unsqueeze(0)
+            xx_base = xx_base.unsqueeze(0)
 
-        d_feat = self.latent_dim
-        use_canon = self._default_use_canonical if use_canonical is None else bool(use_canonical)
-        canonical_vectors = self._get_canonical_embeddings() if use_canon else []
+            d_feat = self.latent_dim
+            use_canon = self._default_use_canonical if use_canonical is None else bool(use_canonical)
+            canonical_vectors = self._get_canonical_embeddings() if use_canon else []
 
-        for start in range(0, Dv, z_per_chunk):
-            end = min(start + z_per_chunk, Dv)
-            depth = end - start
+            for start in range(0, Dv, z_per_chunk):
+                end = min(start + z_per_chunk, Dv)
+                depth = end - start
 
-            z_chunk = z_coords[start:end].view(-1, 1, 1).expand(-1, Hv, Wv)
-            yy = yy_base.expand(depth, -1, -1)
-            xx = xx_base.expand(depth, -1, -1)
-            coords = torch.stack([xx, yy, z_chunk], dim=-1).reshape(-1, 3)
+                z_chunk = z_coords[start:end].view(-1, 1, 1).expand(-1, Hv, Wv)
+                yy = yy_base.expand(depth, -1, -1)
+                xx = xx_base.expand(depth, -1, -1)
+                coords = torch.stack([xx, yy, z_chunk], dim=-1).reshape(-1, 3)
 
-            feat_s, feat_p, feat_w = self.semantic(coords)
-            for key, feats in (("s", feat_s), ("p", feat_p), ("w", feat_w)):
-                if feats is None:
-                    continue
-                flat = feats.to(dtype=torch.float32).view(-1, d_feat)
+                feat_s, feat_p, feat_w = self.semantic(coords)
+                for key, feats in (("s", feat_s), ("p", feat_p), ("w", feat_w)):
+                    if feats is None:
+                        continue
+                    flat = feats.to(dtype=dtype).view(-1, d_feat)
 
-                if self.autoencoder is not None:
-                    decoded = self.autoencoder.decoder(flat)
-                    flat_512 = _normalize(decoded, eps=1e-6).to(dtype=torch.float32)
-                else:
-                    flat_512 = _normalize(flat, eps=1e-6).to(dtype=torch.float32)
+                    # with torch.no_grad():
+                    #     flat = self.autoencoder.decoder(flat)
+                    scores_flat = relevancy_score(flat, z_text, canonical_vectors)
+                    S_levels[key][start:end] = scores_flat.view(depth, Hv, Wv)
 
-                scores_flat = relevancy_score(flat_512, z_text, canonical_vectors)
-                S_levels[key][start:end] = scores_flat.view(depth, Hv, Wv)
+            if pad > 0:
+                weight = torch.ones((1, 1, kernel, kernel, kernel), device=device, dtype=torch.float32)
+                ones_volume = torch.ones((1, 1, Dv, Hv, Wv), device=device, dtype=torch.float32)
+                norm = F.conv3d(ones_volume, weight, padding=pad)
+                norm = norm.clamp_min(1.0)
+                for key in S_levels.keys():
+                    vol = S_levels[key].unsqueeze(0).unsqueeze(0)
+                    smoothed = F.conv3d(vol, weight, padding=pad) / norm
+                    S_levels[key] = smoothed.squeeze(0).squeeze(0).contiguous()
+                del weight, ones_volume, norm
 
-            del coords, z_chunk, yy, xx
+            self._S_levels = {k: v.contiguous() for k, v in S_levels.items()}
+            self.hierarchy_mode = mode
+            self._S, selected = self._resolve_hierarchy_map(mode)
+            self._selected_level = selected
 
-        if pad > 0:
-            weight = torch.ones((1, 1, kernel, kernel, kernel), device=device, dtype=torch.float32)
-            ones_volume = torch.ones((1, 1, Dv, Hv, Wv), device=device, dtype=torch.float32)
-            norm = F.conv3d(ones_volume, weight, padding=pad)
-            norm = norm.clamp_min(1.0)
-            for key in S_levels.keys():
-                vol = S_levels[key].unsqueeze(0).unsqueeze(0)
-                smoothed = F.conv3d(vol, weight, padding=pad) / norm
-                S_levels[key] = smoothed.squeeze(0).squeeze(0).contiguous()
-            del weight, ones_volume, norm
-
-        self._S_levels = {k: v.contiguous() for k, v in S_levels.items()}
-        self.hierarchy_mode = mode
-        self._S, selected = self._resolve_hierarchy_map(mode)
-        self._selected_level = selected
-
-        flat_idx = int(torch.argmax(self._S).item())
-        d = flat_idx // (Hv * Wv)
-        h = (flat_idx % (Hv * Wv)) // Wv
-        w = flat_idx % Wv
-        self._argmax_norm = torch.stack([x_coords[w], y_coords[h], z_coords[d]])
+            flat_idx = int(torch.argmax(self._S).item())
+            d = flat_idx // (Hv * Wv)
+            h = (flat_idx % (Hv * Wv)) // Wv
+            w = flat_idx % Wv
+            self._argmax_norm = torch.stack([x_coords[w], y_coords[h], z_coords[d]])
+        except Exception as e:
+            print(f"[viewer] Error building similarity grid: {e}")
+            raise
 
     def _resolve_hierarchy_map(self, mode: str) -> Tuple[torch.Tensor, str]:
         """

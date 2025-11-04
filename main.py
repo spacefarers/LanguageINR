@@ -1,5 +1,5 @@
 import fire
-from config import device, VOLUME_DIMS, dtype, np_dtype, TRANSFER_FUNCTION_PATH
+from config import device, VOLUME_DIMS, dtype, np_dtype, TRANSFER_FUNCTION_PATH, VOLUME_NAME
 import stage1
 import os
 import render
@@ -29,12 +29,12 @@ def main(mode="all"):
     elif mode == "autoencoder":
         # Load stage 1 model for autoencoder training
         model = NGP_TCNN(opt).to(device)
-        model.load_state_dict(torch.load("./models/stage1_ngp_tcnn.pth", map_location=device))
+        model.load_state_dict(torch.load(f"./models/stage1_{VOLUME_NAME}.pth", map_location=device))
         vol, dims = stage1.load_volume_data()
         model.eval()
     else:
         model = NGP_TCNN(opt).to(device)
-        model.load_state_dict(torch.load("./models/stage1_ngp_tcnn.pth", map_location=device))
+        model.load_state_dict(torch.load(f"./models/stage1_{VOLUME_NAME}.pth", map_location=device))
         vol, dims = stage1.load_volume_data()
 
     if mode != "autoencoder":
@@ -94,7 +94,7 @@ def main(mode="all"):
 
             # Load CLIP model
             print("\nLoading CLIP model...")
-            clip_model, clip_preprocess = stage2.load_clip_model(model_name="ViT-B/32")
+            clip_model, clip_preprocess = stage2.load_clip_model()
             print("  CLIP model loaded")
 
             # Train the Autoencoder
@@ -109,7 +109,7 @@ def main(mode="all"):
                 num_epochs=num_epochs,
                 lr=lr,
                 image_hw=image_hw,
-                save_path="./models/stage2_autoencoder.pth",
+                save_path=f"./models/stage2_{VOLUME_NAME}_autoencoder.pth",
                 neptune_run=run,
             )
             print("Autoencoder Training Completed.")
@@ -137,8 +137,8 @@ def main(mode="all"):
             print("Stage 1 model frozen for Stage 2 training")
 
             # Training configuration
-            num_steps = 250
-            image_hw = (128, 128)
+            num_steps = 350
+            image_hw = (256, 256)
             lr = 1e-3
 
             print(f"\nConfiguration:")
@@ -162,13 +162,13 @@ def main(mode="all"):
 
             # Load CLIP model
             print("\nLoading CLIP model...")
-            clip_model, clip_preprocess = stage2.load_clip_model(model_name="ViT-B/32")
+            clip_model, clip_preprocess = stage2.load_clip_model()
             print("  CLIP model loaded")
 
             # Load the pre-trained Autoencoder
             print("\nLoading pre-trained Autoencoder...")
             autoencoder = SceneAutoencoder().to(device)
-            autoencoder_path = "./models/stage2_autoencoder.pth"
+            autoencoder_path = f"./models/stage2_{VOLUME_NAME}_autoencoder.pth"
             if os.path.exists(autoencoder_path):
                 autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
                 print(f"  Autoencoder loaded from {autoencoder_path}")
@@ -212,14 +212,14 @@ def main(mode="all"):
 
             # Save semantic layer
             os.makedirs("./models", exist_ok=True)
-            model_path = "./models/stage2_semantic_head.pth"
+            model_path = f"./models/stage2_{VOLUME_NAME}_semantic_head.pth"
             torch.save(semantic_layer.state_dict(), model_path)
             print(f"\nSaved trained semantic layer to {model_path}")
 
             # Track model files to Neptune (using the same run)
             if run is not None:
                 run["model/semantic_head"].track_files(model_path)
-                run["model/autoencoder"].track_files("./models/stage2_autoencoder.pth")
+                run["model/autoencoder"].track_files(f"./models/stage2_{VOLUME_NAME}_autoencoder.pth")
 
             # Print training summary
             print("\nStage 2 Training Completed.")
@@ -229,40 +229,6 @@ def main(mode="all"):
         finally:
             # Stop Neptune run
             stop_neptune_run()
-
-    if mode == "infer" or mode == "all":
-        print("\nRunning Stage 2 inference renders...")
-        inference_phrases = ["pot", "container", "planter", "soil", "ground", "foliage", "leaves"]
-        try:
-            from stage2_viewer import VolumeSemanticSearcher, _default_orbit, _build_camera
-            import imageio
-
-            searcher = VolumeSemanticSearcher(
-                stage1_path="./models/stage1_ngp_tcnn.pth",
-                stage2_head_path="./models/stage2_semantic_head.pth",
-                autoencoder_path="./models/stage2_autoencoder.pth",
-            )
-            orbit = _default_orbit(searcher)
-            cam = _build_camera(orbit)
-            os.makedirs("results", exist_ok=True)
-
-            for phrase in inference_phrases:
-                print(f"  - Rendering phrase '{phrase}'")
-                z_text = searcher.encode_text(phrase)
-                searcher.build_similarity_grid(
-                    z_text,
-                    aggregation_radius=0,
-                    hierarchy_mode="auto",
-                    use_canonical=True,
-                )
-                img = searcher.render_highlight(cam, threshold=0.6, blob_radius_vox=0.0)
-                safe_name = phrase.lower().replace(" ", "_")
-                out_path = os.path.join("results", f"stage2_{safe_name}.png")
-                imageio.imwrite(out_path, img)
-                print(f"    Saved {out_path}")
-                torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"[warning] Stage 2 inference failed: {e}")
 
 if __name__ == "__main__":
     fire.Fire(main)

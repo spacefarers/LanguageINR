@@ -9,13 +9,14 @@ import torch
 import torch.nn as nn
 import inspect
 import numpy as np
+import random
 from typing import Tuple, List, Dict, Optional
 import os
 from pathlib import Path
 import imageio
 import colorsys
 
-from config import device, dtype, VOLUME_DIMS, opt
+from config import device, dtype, VOLUME_DIMS, opt, VOLUME_NAME
 import render
 
 
@@ -375,13 +376,12 @@ def save_debug_images(
 # ==============================================================================
 # CLIP feature generation
 # ==============================================================================
-
-def load_clip_model(model_name: str = "ViT-B/32"):
+def load_clip_model(model_name: str = "ViT-L-14"):
     """
     Load a CLIP model and preprocessor using open_clip.
 
     Args:
-        model_name: Model name (e.g., "ViT-B/32", "ViT-B/16", "ViT-L/14")
+        model_name: Model name (e.g., "ViT-B-32", "ViT-B-16", "ViT-L-14", "ViT-L-14-336")
 
     Returns:
         Tuple of (model, preprocess):
@@ -412,29 +412,67 @@ def load_clip_model(model_name: str = "ViT-B/32"):
     return model, preprocess
 
 
-def generate_clip_features_from_masks(
+def _filter_and_partition_masks(mask_list: List[Dict], H: int, W: int) -> List[np.ndarray]:
+    """Deduplicate masks and return non-overlapping boolean partitions."""
+    if not mask_list:
+        return []
+
+    prepared = []
+    for mask in mask_list:
+        seg = np.asarray(mask['segmentation'], dtype=bool)
+        area = int(mask.get('area', int(seg.sum())))
+        if area == 0:
+            continue
+        prepared.append({
+            'seg': seg,
+            'area': area,
+            'pred_iou': float(mask.get('predicted_iou', 0.0)),
+            'stability': float(mask.get('stability_score', 0.0)),
+        })
+
+    if not prepared:
+        return []
+
+    # Sort by predicted IoU, then stability, then area (descending)
+    prepared.sort(key=lambda m: (m['pred_iou'], m['stability'], m['area']), reverse=True)
+
+    deduped: List[np.ndarray] = []
+    for entry in prepared:
+        seg = entry['seg']
+        duplicate = False
+        for existing in deduped:
+            inter = np.logical_and(seg, existing).sum()
+            union = np.logical_or(seg, existing).sum()
+            if union > 0 and inter / union > 0.9:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        deduped.append(seg)
+
+    partitions: List[np.ndarray] = []
+    assigned = np.zeros((H, W), dtype=bool)
+    for seg in deduped:
+        remaining = np.logical_and(seg, ~assigned)
+        if remaining.sum() < 5:
+            continue
+        partitions.append(remaining)
+        assigned |= remaining
+
+    return partitions
+
+
+def compute_mask_embeddings(
     image: torch.Tensor,
     masks_grouped: Dict[str, List[Dict]],
     clip_model,
     clip_preprocess,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Dict[str, List[Dict[str, object]]]:
     """
-    Generate CLIP features for each SAM mask hierarchy level.
+    Precompute CLIP embeddings for each disjoint SAM mask region.
 
-    For each hierarchy level (s, p, w), creates a [H, W, 512] feature map
-    where each pixel gets the CLIP embedding of its mask region.
-
-    This function enforces non-overlapping regions per level by greedily
-    assigning pixels to the highest-quality mask (predicted IoU, stability).
-
-    Args:
-        image: [H, W, 3] RGB tensor in range [0, 1] (float32)
-        masks_grouped: Dict with keys 's', 'p', 'w', each containing list of masks
-        clip_model: Loaded CLIP model
-        clip_preprocess: CLIP preprocessing function
-
-    Returns:
-        Tuple of (feat_s, feat_p, feat_w), each [H, W, 512] feature maps
+    Returns a dictionary mapping hierarchy level to a list of dictionaries
+    with 'mask' (np.ndarray bool) and 'embedding' (torch.Tensor, normalized).
     """
     import PIL.Image
     import torch.nn.functional as F
@@ -442,78 +480,19 @@ def generate_clip_features_from_masks(
     H, W = image.shape[:2]
     image_np = (image.cpu().numpy() * 255).astype(np.uint8)
 
-    # Initialize feature maps for each hierarchy level
-    feature_maps = {
-        's': torch.zeros((H, W, 512), device=device, dtype=dtype),
-        'p': torch.zeros((H, W, 512), device=device, dtype=dtype),
-        'w': torch.zeros((H, W, 512), device=device, dtype=dtype),
-    }
+    results: Dict[str, List[Dict[str, object]]] = {'s': [], 'p': [], 'w': []}
 
-    def _filter_and_partition(mask_list: List[Dict]) -> List[np.ndarray]:
-        """Deduplicate masks and return non-overlapping boolean partitions."""
-        if not mask_list:
-            return []
-
-        # Prepare masks with metadata for sorting and deduplication
-        prepared = []
-        for mask in mask_list:
-            seg = np.asarray(mask['segmentation'], dtype=bool)
-            area = int(mask.get('area', int(seg.sum())))
-            if area == 0:
-                continue
-            prepared.append({
-                'seg': seg,
-                'area': area,
-                'pred_iou': float(mask.get('predicted_iou', 0.0)),
-                'stability': float(mask.get('stability_score', 0.0)),
-            })
-
-        if not prepared:
-            return []
-
-        # Sort by predicted IoU, then stability, then area (descending)
-        prepared.sort(key=lambda m: (m['pred_iou'], m['stability'], m['area']), reverse=True)
-
-        deduped: List[np.ndarray] = []
-        for entry in prepared:
-            seg = entry['seg']
-            # Remove masks that are near-duplicates via IoU threshold
-            duplicate = False
-            for existing in deduped:
-                inter = np.logical_and(seg, existing).sum()
-                union = np.logical_or(seg, existing).sum()
-                if union > 0 and inter / union > 0.9:
-                    duplicate = True
-                    break
-            if duplicate:
-                continue
-            deduped.append(seg)
-
-        partitions: List[np.ndarray] = []
-        assigned = np.zeros((H, W), dtype=bool)
-        for seg in deduped:
-            remaining = np.logical_and(seg, ~assigned)
-            if remaining.sum() < 5:
-                continue
-            partitions.append(remaining)
-            assigned |= remaining
-
-        return partitions
-
-    # Process each hierarchy level
     for level in ['s', 'p', 'w']:
         masks = masks_grouped[level]
-
-        if len(masks) == 0:
+        if not masks:
             continue
 
-        partitions = _filter_and_partition(masks)
+        partitions = _filter_and_partition_masks(masks, H, W)
         if not partitions:
             continue
 
-
-        # Process each disjoint region at this level
-        for idx, seg in enumerate(partitions):
+        entries: List[Dict[str, object]] = []
+        for seg in partitions:
             try:
                 y_indices, x_indices = np.where(seg)
                 if len(y_indices) == 0:
@@ -521,8 +500,6 @@ def generate_clip_features_from_masks(
 
                 y_min, y_max = y_indices.min(), y_indices.max() + 1
                 x_min, x_max = x_indices.min(), x_indices.max() + 1
-
-                # Skip tiny crops
                 if (y_max - y_min) < 2 or (x_max - x_min) < 2:
                     continue
 
@@ -539,15 +516,65 @@ def generate_clip_features_from_masks(
                     embedding = F.normalize(embedding, dim=-1)
                     embedding = embedding.squeeze(0).to(device=device, dtype=dtype)
 
-                # Convert numpy mask to torch tensor for proper indexing
-                seg_t = torch.from_numpy(seg).to(device=device, dtype=torch.bool)
-                # Write the 512-D vector at all masked pixels
-                feature_maps[level][seg_t, :] = embedding
+                entries.append({'mask': seg, 'embedding': embedding})
 
-            except Exception as e:
-                print(f"    Warning: Failed to process region {idx} at level '{level}': {e}", flush=True)
+            except Exception as exc:
+                print(f"    Warning: Failed to process region at level '{level}': {exc}", flush=True)
                 continue
 
+        results[level] = entries
+
+    return results
+
+
+def _feature_maps_from_embeddings(
+    embeddings: Dict[str, List[Dict[str, object]]],
+    H: int,
+    W: int,
+) -> Dict[str, torch.Tensor]:
+    """Build dense [H,W,768] maps from precomputed mask embeddings."""
+    feature_maps = {
+        's': torch.zeros((H, W, 768), device=device, dtype=dtype),
+        'p': torch.zeros((H, W, 768), device=device, dtype=dtype),
+        'w': torch.zeros((H, W, 768), device=device, dtype=dtype),
+    }
+
+    for level, entries in embeddings.items():
+        if not entries:
+            continue
+        feature_map = feature_maps[level]
+        for entry in entries:
+            seg = entry['mask']
+            embedding = entry['embedding']
+            seg_t = torch.from_numpy(seg).to(device=device, dtype=torch.bool)
+            feature_map[seg_t, :] = embedding.to(device=device, dtype=dtype)
+
+    return feature_maps
+
+
+def generate_clip_features_from_masks(
+    image: torch.Tensor,
+    masks_grouped: Dict[str, List[Dict]],
+    clip_model,
+    clip_preprocess,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate CLIP features for each SAM mask hierarchy level.
+
+    For each hierarchy level (s, p, w), creates a [H, W, 768] feature map
+    where each pixel gets the CLIP embedding of its mask region.
+
+    This function enforces non-overlapping regions per level by greedily
+    assigning pixels to the highest-quality mask (predicted IoU, stability).
+    """
+    H, W = image.shape[:2]
+    embeddings = compute_mask_embeddings(
+        image=image,
+        masks_grouped=masks_grouped,
+        clip_model=clip_model,
+        clip_preprocess=clip_preprocess,
+    )
+    feature_maps = _feature_maps_from_embeddings(embeddings, H, W)
     return feature_maps['s'], feature_maps['p'], feature_maps['w']
 
 
@@ -566,7 +593,7 @@ def train_autoencoder(
     num_epochs: int = 100,
     lr: float = 1e-3,
     image_hw: Tuple[int, int] = (128, 128),
-    save_path: str = "./models/stage2_autoencoder.pth",
+    save_path: str = f"./models/stage2_{VOLUME_NAME}_autoencoder.pth",
     neptune_run = None,
 ) -> "nn.Module":
     """
@@ -586,7 +613,7 @@ def train_autoencoder(
     grid_inr.eval()
     total_masks = {'s': 0, 'p': 0, 'w': 0}
 
-    for step in tqdm(range(num_gather_steps), desc="Gathering features"):
+    for step in tqdm(range(num_gather_steps), desc="Gathering Features"):
         # Generate random render
         img, camera = generate_random_render(
             grid_inr=grid_inr,
@@ -613,7 +640,7 @@ def train_autoencoder(
 
         # Collect all non-zero features
         for feat_map in [clip_feat_s, clip_feat_p, clip_feat_w]:
-            feat_flat = feat_map.reshape(-1, 512)
+            feat_flat = feat_map.reshape(-1, 768)
             mask = feat_flat.norm(dim=-1) > 0.1
             if mask.sum() > 0:
                 all_features.append(feat_flat[mask].detach())
@@ -643,7 +670,7 @@ def train_autoencoder(
         }
 
     # --- 2. Train Autoencoder ---
-    autoencoder = SceneAutoencoder().to(device)
+    autoencoder = SceneAutoencoder(latent_dim=latent_dim).to(device)
     autoencoder.train()
 
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=lr)
@@ -771,6 +798,7 @@ def train_semantic_layer(
     num_steps: int = 100,
     image_hw: Tuple[int, int] = (128, 128),
     batch_size: int = 8192,  # Batch size for ray processing (fixed from 1 to prevent fragmentation)
+    num_precomputed_views: int = 50,
     save_debug_every: int = 10,  # Save debug images every N steps
     neptune_run = None,
 ) -> Dict:
@@ -792,6 +820,82 @@ def train_semantic_layer(
     # Precompute opacity once so semantic rendering no longer queries grid_inr
     opacity_volume = precompute_opacity_volume(grid_inr, transfer_function)
 
+    render_step_size = 2.0
+    target_views = num_precomputed_views
+    precomputed_views: List[Dict[str, object]] = []
+    attempts = 0
+    max_attempts = max(target_views * 10, target_views + 5)
+
+    print(f"\n[Stage 2 Training] Precomputing {target_views} training views...", flush=True)
+
+    with tqdm(total=target_views, desc="Preparing views") as prepbar:
+        while len(precomputed_views) < target_views and attempts < max_attempts:
+            attempts += 1
+            with torch.no_grad():
+                img, camera = generate_random_render(
+                    grid_inr=grid_inr,
+                    transfer_function=transfer_function,
+                    image_hw=image_hw,
+                    render_step_size=render_step_size,
+                )
+
+                masks = segment_image_with_sam2(img, sam_generator=sam_generator)
+                groups_raw = partition_masks_by_area(masks)
+                embeddings = compute_mask_embeddings(
+                    image=img,
+                    masks_grouped=groups_raw,
+                    clip_model=clip_model,
+                    clip_preprocess=clip_preprocess,
+                )
+
+            partitions_cpu: Dict[str, List[Dict[str, object]]] = {'s': [], 'p': [], 'w': []}
+            debug_groups: Dict[str, List[Dict[str, object]]] = {'s': [], 'p': [], 'w': []}
+
+            has_any_region = False
+            for level in ['p']:
+                entries: List[Dict[str, object]] = []
+                for entry in embeddings[level]:
+                    mask_np = np.asarray(entry['mask'], dtype=bool).copy()
+                    if mask_np.sum() < 5:
+                        continue
+                    embedding_cpu = entry['embedding'].detach().to(device='cpu', dtype=dtype).contiguous()
+                    entries.append({'mask': mask_np, 'embedding': embedding_cpu})
+                    debug_groups[level].append({'segmentation': mask_np})
+                if entries:
+                    partitions_cpu[level] = entries
+                    has_any_region = True
+
+            if not has_any_region:
+                continue
+            if not partitions_cpu['p']:
+                # Require part-level supervision since current training focuses on head 'p'
+                continue
+
+            H_img, W_img = int(img.shape[0]), int(img.shape[1])
+            precomputed_views.append({
+                'image': img.detach().to(device='cpu', dtype=dtype).contiguous(),
+                'camera': camera,
+                'partitions': partitions_cpu,
+                'debug_groups': debug_groups,
+                'hw': (H_img, W_img),
+            })
+            prepbar.update(1)
+
+    if len(precomputed_views) < target_views:
+        raise RuntimeError(
+            f"Failed to gather {target_views} training views with valid SAM masks (collected {len(precomputed_views)})."
+        )
+
+    if run is not None:
+        run["train/precomputed_views"] = {
+            "requested": target_views,
+            "collected": len(precomputed_views),
+            "attempts": attempts,
+        }
+
+    view_indices = list(range(len(precomputed_views)))
+    random.shuffle(view_indices)
+
     semantic_layer.train()
     history = {
         'loss': [],
@@ -804,39 +908,22 @@ def train_semantic_layer(
     for step in pbar:
         optimizer.zero_grad()
 
-        # ====================================================================
-        # Path 1: Generate random render and CLIP ground truth
-        # ====================================================================
+        if step % len(view_indices) == 0 and step > 0:
+            random.shuffle(view_indices)
 
-        # Explicitly disable gradients for ground truth generation to prevent memory leaks
-        with torch.no_grad():
-            # Generate random perspective render with same step size as semantic rendering
-            render_step_size = 2.0
-            img, camera = generate_random_render(
-                grid_inr=grid_inr,
-                transfer_function=transfer_function,
-                image_hw=image_hw,
-                render_step_size=render_step_size,
-            )
+        dataset_idx = view_indices[step % len(view_indices)]
+        view = precomputed_views[dataset_idx]
 
-            # Segment with SAM2
-            masks = segment_image_with_sam2(img, sam_generator=sam_generator)
-
-            # Partition into hierarchies
-            groups = partition_masks_by_area(masks)
-
-            # Generate CLIP features (ground truth)
-            clip_feat_s, clip_feat_p, clip_feat_w = generate_clip_features_from_masks(
-                image=img,
-                masks_grouped=groups,
-                clip_model=clip_model,
-                clip_preprocess=clip_preprocess,
-            )
+        img = view['image']
+        camera = view['camera']
+        groups = view['debug_groups']
+        H_view, W_view = view['hw']
+        feature_maps = _feature_maps_from_embeddings(view['partitions'], H_view, W_view)
 
         gt_feat_dict = {
-            's': clip_feat_s,
-            'p': clip_feat_p,
-            'w': clip_feat_w,
+            's': feature_maps['s'],
+            'p': feature_maps['p'],
+            'w': feature_maps['w'],
         }
 
         def compute_loss(pred_feat, target_feat_512):
@@ -845,7 +932,7 @@ def train_semantic_layer(
 
             Args:
                 pred_feat: [H, W, latent_dim] latent predictions from semantic layer render
-                target_feat_512: [H, W, 512] CLIP embeddings from masks
+                target_feat_512: [H, W, 768] CLIP embeddings from masks
 
             Returns:
                 Tuple (loss_tensor, valid_count) where loss_tensor may be None if
@@ -863,12 +950,11 @@ def train_semantic_layer(
             pred_valid = pred_flat[valid_mask]
             target_valid = target_flat[valid_mask]
 
-            # Decode latent predictions back to CLIP space (autoencoder is frozen)
-            # Note: decoder must stay in computational graph for gradients to flow to pred_valid
-            # Memory cost: ~32 MB per head (acceptable for frozen decoder)
-            pred_clip = autoencoder.decoder(pred_valid)
+            target_latent = autoencoder.encoder(target_valid)
+            # print(target_latent.norm(dim=-1).mean().item())
+            # print(pred_valid.norm(dim=-1).mean().item())
 
-            similarity = F.cosine_similarity(pred_clip, target_valid, dim=-1)
+            similarity = F.cosine_similarity(pred_valid, target_latent, dim=-1)
             loss = (1.0 - similarity).mean()
             return loss, valid_count
 
@@ -884,7 +970,7 @@ def train_semantic_layer(
                 semantic_layer=semantic_layer,
                 camera=camera,
                 opacity_volume=opacity_volume,
-                image_hw=image_hw,
+                image_hw=view['hw'],
                 batch_size=batch_size,
                 render_step_size=render_step_size,
             )
@@ -892,7 +978,7 @@ def train_semantic_layer(
             loss_tensor, valid_count = compute_loss(render_feat, gt_feat_dict[head])
 
             if loss_tensor is None:
-                history[f'loss_{head}'].append(0.0)
+                head_losses[head] = 0.0
                 if run is not None:
                     run[f'train/loss_{head}'].append(0.0)
                     run[f'train/masks_{head}'].append(len(groups[head]))
@@ -909,11 +995,14 @@ def train_semantic_layer(
             loss_value = float(loss_tensor.item())
             head_losses[head] = loss_value
             step_loss_total += loss_value
-            history[f'loss_{head}'].append(loss_value)
             if run is not None:
                 run[f'train/loss_{head}'].append(loss_value)
                 run[f'train/masks_{head}'].append(len(groups[head]))
                 run[f'train/valid_pixels_{head}'].append(valid_count)
+
+        for head_key in ['s', 'p', 'w']:
+            value = head_losses[head_key] if head_losses[head_key] is not None else 0.0
+            history[f'loss_{head_key}'].append(value)
 
         history['loss'].append(step_loss_total)
         if run is not None:

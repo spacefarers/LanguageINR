@@ -15,14 +15,14 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from config import TRANSFER_FUNCTION_PATH, VOLUME_DIMS, device, dtype, opt
+from config import TRANSFER_FUNCTION_PATH, VOLUME_DIMS, device, dtype, opt, VOLUME_NAME
 from model import NGP_TCNN
 from render import Camera, ParaViewTransferFunction, render_with_nerfacc
 from encoders.lseg_encoder.modules.lseg_module import LSegModule
-import clip
+import open_clip
 
 
-STAGE1_PATH_DEFAULT = "./models/stage1_ngp_tcnn.pth"
+STAGE1_PATH_DEFAULT = f"./models/stage1_{VOLUME_NAME}.pth"
 TRANSFER_FUNCTION_DEFAULT = TRANSFER_FUNCTION_PATH
 
 
@@ -168,7 +168,7 @@ class LSegHeatmapEngine:
         with torch.no_grad():
             feats = self.lseg_model(tensor, return_feature=True).to(torch.float32)
         feats = F.normalize(feats, dim=1)
-        tokens = clip.tokenize([phrase or "object"]).to(device)
+        tokens = open_clip.tokenize([phrase or "object"]).to(device)
         with torch.no_grad():
             text_feat = self.lseg_model.net.clip_pretrained.encode_text(tokens)
         text_feat = F.normalize(text_feat.float(), dim=-1)[0]

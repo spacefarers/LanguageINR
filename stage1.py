@@ -2,7 +2,7 @@ from model import NGP_TCNN
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from config import device, opt
+from config import device, opt, VOLUME_NAME
 from dataio import load_volume_data
 import os
 
@@ -49,7 +49,7 @@ def train_stage1_model(num_epochs=10, lr=1e-3, batch_size=65536):
     print(f"Final PSNR: {psnr:.2f} dB")
 
     os.makedirs("./models", exist_ok=True)
-    torch.save(model.state_dict(), "./models/stage1_ngp_tcnn.pth")
+    torch.save(model.state_dict(), f"./models/stage1_{VOLUME_NAME}.pth")
     return model, pred_vol
 
 def evaluate_psnr_and_save_raw(model, vol, save_path="results/stage1/prediction.raw"):

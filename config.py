@@ -14,17 +14,26 @@ batch_size = 1
 # VOLUME_PATH = "/home/spacefarers/d/data/open-scivis/lobster_301x324x56_uint8_normalized_float32.raw"
 # VOLUME_DIMS = [301, 324, 56]
 # TRANSFER_FUNCTION_PATH = "./paraview_tf/lobster.json"
+# VOLUME_NAME = "lobster"
 
-VOLUME_PATH = "data/bonsai_256x256x256_uint8_float32_normalized.raw"
-VOLUME_DIMS = [256, 256, 256]
-TRANSFER_FUNCTION_PATH = "./paraview_tf/bonsai2.json"
+# VOLUME_PATH = "data/bonsai_256x256x256_uint8_float32_normalized.raw"
+# VOLUME_DIMS = [256, 256, 256]
+# TRANSFER_FUNCTION_PATH = "./paraview_tf/bonsai2.json"
+# VOLUME_NAME = "bonsai"
 
 # VOLUME_PATH = "data/chameleon_256x256x270_float32_normalized.raw"
 # VOLUME_DIMS = [256, 256, 270]
 # TRANSFER_FUNCTION_PATH = "./paraview_tf/chameleon.json"
+# VOLUME_NAME = "chameleon"
+
+VOLUME_PATH = "data/backpack_256x256x186_float32_normalized.raw"
+VOLUME_DIMS = [256, 256, 186]
+TRANSFER_FUNCTION_PATH = "./paraview_tf/backpack.json"
+VOLUME_NAME = "backpack"
 
 np_dtype = np.float32
 dtype = torch.float32
+
 
 if "CRC" in machine:
     root_data_dir = '/users/myang9/afs/data/'

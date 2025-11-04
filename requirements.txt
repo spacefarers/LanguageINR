@@ -9,5 +9,6 @@ nerfacc
 torchvision
 imageio
 fire
-open-clip-torch
+timm>=1.0.15
+open-clip-torch>=2.31.0
 ninja
